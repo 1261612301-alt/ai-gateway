@@ -1,8 +1,11 @@
 import os
 import time
 import uuid
+import json
+import asyncio
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from google import genai
 from pydantic import BaseModel, ConfigDict
 from upstash_redis import Redis
@@ -45,8 +48,8 @@ STATS_HITS_KEY = "stats:cache_hits"
 # ==================== 2. 初始化 ====================
 app = FastAPI(
     title="AI Semantic Cache Gateway API",
-    version="2.0.0",
-    description="基于 Upstash Vector 语义向量检索的 AI 降本网关",
+    version="2.1.0",
+    description="基于 Upstash Vector 语义向量检索与流式传输的 AI 降本网关",
 )
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -176,11 +179,9 @@ def save_semantic_cache(prompt: str, ai_response: str, query_vector: list[float]
     )
 
 
-# ==================== 3. 核心语义缓存路由 ====================
+# ==================== 3. 核心语义缓存路由（支持 Stream 流式传输） ====================
 @app.post("/v1/chat/completions")
 def chat_gateway(request: ChatRequest):
-    if request.stream:
-        raise HTTPException(status_code=400, detail="当前网关暂不支持 stream=true")
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages 不能为空")
 
@@ -195,9 +196,42 @@ def chat_gateway(request: ChatRequest):
         if metadata:
             cached_response = metadata.get("ai_response") or metadata.get("response")
 
+        # ----------------------------------------------------
+        # 情况 A：命中语义缓存
+        # ----------------------------------------------------
         if cached_response and similarity_score >= SIMILARITY_THRESHOLD:
-            latency_ms = round((time.time() - start_time) * 1000, 2)
             redis_client.incr(STATS_HITS_KEY)
+            
+            # 如果客户端请求了流式传输 (stream=True)
+            if request.stream:
+                async def fake_stream_generator():
+                    chunk_size = 2  # 每次吐 2 个字符，营造丝滑打字机效果
+                    for i in range(0, len(cached_response), chunk_size):
+                        chunk = cached_response[i:i+chunk_size]
+                        chunk_data = {
+                            "id": "chatcmpl-gateway",
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": request.model,
+                            "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}]
+                        }
+                        yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
+                        await asyncio.sleep(0.01)
+                    
+                    final_chunk = {
+                        "id": "chatcmpl-gateway",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": request.model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                    }
+                    yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                return StreamingResponse(fake_stream_generator(), media_type="text/event-stream")
+
+            # 非流式直接返回
+            latency_ms = round((time.time() - start_time) * 1000, 2)
             return {
                 "id": "chatcmpl-gateway",
                 "object": "chat.completion",
@@ -218,6 +252,82 @@ def chat_gateway(request: ChatRequest):
                 },
             }
 
+        # ----------------------------------------------------
+        # 情况 B：未命中缓存，调用大模型
+        # ----------------------------------------------------
+        if request.stream:
+            candidates: list[str] = []
+            if request.model and request.model.startswith("gemini") and "2.5" not in request.model:
+                candidates.append(request.model)
+            for name in CHAT_FALLBACKS:
+                if name not in candidates:
+                    candidates.append(name)
+
+            async def llm_stream_generator():
+                full_text = ""
+                used_model = request.model
+                success = False
+                last_exc = None
+
+                for model in candidates:
+                    try:
+                        used_model = model
+                        response_stream = ai_client.models.generate_content_stream(
+                            model=model, contents=user_prompt
+                        )
+                        for chunk in response_stream:
+                            text_chunk = getattr(chunk, "text", "")
+                            if text_chunk:
+                                full_text += text_chunk
+                                chunk_data = {
+                                    "id": "chatcmpl-gateway",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": used_model,
+                                    "choices": [{"index": 0, "delta": {"content": text_chunk}, "finish_reason": None}]
+                                }
+                                yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
+                        success = True
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        err_str = str(exc).upper()
+                        if any(token in err_str for token in ("404", "NOT_FOUND", "NO LONGER AVAILABLE", "503", "UNAVAILABLE", "429")):
+                            continue
+                        break
+
+                if not success:
+                    err_chunk = {
+                        "id": "chatcmpl-gateway",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": request.model,
+                        "choices": [{"index": 0, "delta": {"content": f"\n[网关错误: Gemini 调用失败: {last_exc}]"}, "finish_reason": "stop"}]
+                    }
+                    yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                # 传输结束后，自动写入 Upstash Vector 语义缓存
+                if full_text:
+                    try:
+                        save_semantic_cache(user_prompt, full_text, query_vector)
+                    except Exception as e:
+                        print(f"⚠️ 缓存写入异常: {e}")
+
+                final_chunk = {
+                    "id": "chatcmpl-gateway",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": used_model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                }
+                yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(llm_stream_generator(), media_type="text/event-stream")
+
+        # 非流式调用 Gemini（保留原逻辑）
         ai_response, used_model = ask_gemini(user_prompt, request.model)
         save_semantic_cache(user_prompt, ai_response, query_vector)
         latency_ms = round((time.time() - start_time) * 1000, 2)
@@ -240,6 +350,7 @@ def chat_gateway(request: ChatRequest):
                 "message": "【未命中缓存】已调用大模型，并写入 Upstash Vector",
             },
         }
+
     except HTTPException:
         raise
     except Exception as exc:
