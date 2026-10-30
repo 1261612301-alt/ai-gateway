@@ -9,7 +9,7 @@ import httpx
 from upstash_vector import Index
 from upstash_redis import Redis
 
-app = FastAPI(title="AI Semantic Cache Gateway", version="2.3.1")
+app = FastAPI(title="AI Semantic Cache Gateway", version="2.3.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,10 +21,11 @@ app.add_middleware(
 
 security = HTTPBearer(auto_error=False)
 
-VECTOR_URL = os.getenv("UPSTASH_VECTOR_REST_URL", "")
-VECTOR_TOKEN = os.getenv("UPSTASH_VECTOR_REST_TOKEN", "")
-REDIS_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
-REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+# 🟢 双重兼容：同时支持带 _REST_ 和不带 _REST_ 的环境变量名
+VECTOR_URL = os.getenv("UPSTASH_VECTOR_URL", "") or os.getenv("UPSTASH_VECTOR_REST_URL", "")
+VECTOR_TOKEN = os.getenv("UPSTASH_VECTOR_TOKEN", "") or os.getenv("UPSTASH_VECTOR_REST_TOKEN", "")
+REDIS_URL = os.getenv("UPSTASH_REDIS_URL", "") or os.getenv("UPSTASH_REDIS_REST_URL", "")
+REDIS_TOKEN = os.getenv("UPSTASH_REDIS_TOKEN", "") or os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
 REAL_LLM_API_KEY = os.getenv("REAL_LLM_API_KEY", "")
 REAL_LLM_BASE_URL = os.getenv("REAL_LLM_BASE_URL", "https://api.deepseek.com")
