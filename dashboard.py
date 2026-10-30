@@ -1,109 +1,121 @@
 import streamlit as st
 import requests
-import plotly.express as px
-import pandas as pd
-import time
+import json
 
+# 页面配置
 st.set_page_config(
-    page_title="AI Gateway 监控看板",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    page_title="AI 语义缓存降本网关 - 商业化控制台",
+    page_icon="⚡",
+    layout="wide"
 )
 
-GATEWAY_STATS_URL = "https://ai-gateway-ardy.onrender.com/stats"
+# 侧边栏配置
+st.sidebar.title("⚙️ 网关控制台")
+api_base_url = st.sidebar.text_input(
+    "后端网关 API 地址 (Render URL)", 
+    value="https://ai-gateway-ardy.onrender.com"  
+).strip()
 
-st.title("🚀 AI Gateway 实时语义缓存与降本监控看板")
-st.markdown("实时监控云端网关的请求量、缓存命中率以及降本效果。")
+st.sidebar.markdown("---")
+st.sidebar.info(
+    "💡 **商业化亮点**：\n"
+    "- **毫秒级响应**：缓存命中时 50ms 秒回。\n"
+    "- **极致降本**：高频重复问题绕过大模型，省下 100% Token 费用。"
+)
 
-st.sidebar.header("⚙️ 控制面板")
-auto_refresh = st.sidebar.checkbox("开启自动刷新 (5秒)", value=False)
-if st.sidebar.button("🔄 立即刷新数据"):
-    st.rerun()
+# 主界面 Tabs
+tab1, tab2 = st.tabs(["💬 AI 智能对话测试", "📊 降本增效数据大屏"])
 
-def fetch_stats():
+# ==================== Tab 1: AI 智能对话演练场 ====================
+with tab1:
+    st.header("💬 语义缓存与流式对话网关演示")
+    st.markdown("体验大模型流式吐字，尝试**连续发送两次相同或语义相近的问题**，观察第二次的极致速度！")
+
+    # 初始化对话历史
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    # 渲染历史消息
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # 用户输入
+    if prompt := st.chat_input("输入你的问题（例如：公司年假怎么休？）..."):
+        # 记录用户消息
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        # 助理响应框
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            full_response = ""
+            
+            try:
+                # 构造符合 OpenAI 格式的流式请求
+                payload = {
+                    "model": "gemini-3.1-flash-lite",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": True
+                }
+                url = f"{api_base_url.rstrip('/')}/v1/chat/completions"
+                
+                # 发起 HTTP Stream 请求
+                response = requests.post(url, json=payload, stream=True, timeout=30)
+                
+                if response.status_code != 200:
+                    message_placeholder.error(f"网关响应错误: {response.status_code} - {response.text}")
+                else:
+                    # 逐行解析 SSE 流数据
+                    for line in response.iter_lines():
+                        if line:
+                            decoded = line.decode('utf-8')
+                            if decoded.startswith("data: "):
+                                data_str = decoded[6:]
+                                if data_str == "[DONE]":
+                                    break
+                                try:
+                                    data = json.loads(data_str)
+                                    delta = data["choices"][0].get("delta", {})
+                                    content = delta.get("content", "")
+                                    if content:
+                                        full_response += content
+                                        # 实时展现打字机效果
+                                        message_placeholder.markdown(full_response + "▌")
+                                except Exception:
+                                    pass
+                    
+                    # 最终去除光标
+                    message_placeholder.markdown(full_response)
+                    st.session_state.messages.append({"role": "assistant", "content": full_response})
+                    
+            except Exception as e:
+                message_placeholder.error(f"连接后端网关失败: {e}")
+
+# ==================== Tab 2: 降本增效数据大屏 ====================
+with tab2:
+    st.header("📊 实时降本与缓存命中大屏")
+    st.markdown("通过 Upstash Redis 与 Vector 实时追踪网关的经济效益。")
+
+    if st.button("🔄 刷新统计数据", type="primary"):
+        pass
+
     try:
-        # 加上 timestamp 参数防止 HTTP 缓存
-        response = requests.get(f"{GATEWAY_STATS_URL}?_t={time.time()}", timeout=30)
-        if response.status_code == 200:
-            return response.json()
+        stats_url = f"{api_base_url.rstrip('/')}/stats"
+        res = requests.get(stats_url, timeout=5)
+        
+        if res.status_code == 200:
+            stats_data = res.json().get("metrics", {})
+            
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("总请求数 (Total Requests)", stats_data.get("total_requests", 0))
+            col2.metric("缓存命中数 (Cache Hits)", stats_data.get("cache_hits", 0))
+            col3.metric("缓存命中率 (Hit Rate)", stats_data.get("hit_rate", "0%"))
+            col4.metric("预估节省成本 (Saved Cost)", stats_data.get("estimated_saved_cost", "$0"))
+            
+            st.success("✨ 数据已与 Render 后端及 Upstash 实时同步！")
         else:
-            st.error(f"无法获取数据，HTTP 状态码: {response.status_code}")
-            return None
+            st.warning("⚠️ 暂时无法获取后端统计数据，请检查 API 地址是否正确。")
     except Exception as e:
-        st.error(f"连接云端网关失败: {e}")
-        return None
-
-res = fetch_stats()
-
-if res:
-    # 嵌套提取 metrics 里的真实数据
-    metrics = res.get("metrics", res)
-    
-    total_requests = metrics.get("total_requests", 0)
-    cache_hits = metrics.get("cache_hits", 0)
-    cache_misses = total_requests - cache_hits if total_requests >= cache_hits else 0
-    
-    hit_rate = (cache_hits / total_requests * 100) if total_requests > 0 else 0.0
-    
-    saved_usd = cache_hits * 0.002
-    saved_cny = saved_usd * 7.2
-
-    st.markdown("---")
-
-    # 第一排：核心 KPI 卡片
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric(label="📊 总请求量 (Total)", value=f"{total_requests:,}")
-    with col2:
-        st.metric(label="🎯 缓存命中数 (Hits)", value=f"{cache_hits:,}")
-    with col3:
-        st.metric(label="⚡ 缓存命中率 (Hit Rate)", value=f"{hit_rate:.1f}%")
-    with col4:
-        st.metric(label="💰 预估节省成本", value=f"${saved_usd:.3f}", delta=f"≈ ¥{saved_cny:.2f}")
-
-    st.markdown("---")
-
-    # 第二排：图表分析
-    chart_col1, chart_col2 = st.columns(2)
-
-    with chart_col1:
-        st.subheader("🍰 缓存命中 vs 真实 API 调用占比")
-        if total_requests > 0:
-            df_pie = pd.DataFrame({
-                "类别": ["缓存拦截 (Cache Hit)", "LLM 真实调用 (Cache Miss)"],
-                "请求数": [cache_hits, cache_misses]
-            })
-            fig_pie = px.pie(
-                df_pie, 
-                values="请求数", 
-                names="类别", 
-                color="类别",
-                color_discrete_map={"缓存拦截 (Cache Hit)": "#00CC96", "LLM 真实调用 (Cache Miss)": "#EF553B"},
-                hole=0.4
-            )
-            fig_pie.update_traces(textposition='inside', textinfo='percent+label')
-            st.plotly_chart(fig_pie, use_container_width=True)
-        else:
-            st.info("暂无请求数据，请先发起测试请求。")
-
-    with chart_col2:
-        st.subheader("⚡ 响应延迟对比估算 (Latency)")
-        df_bar = pd.DataFrame({
-            "响应来源": ["语义缓存 (Cache Hit)", "Gemini API 真实调用"],
-            "平均延迟 (秒)": [0.05, 1.20]
-        })
-        fig_bar = px.bar(
-            df_bar, 
-            x="响应来源", 
-            y="平均延迟 (秒)", 
-            color="响应来源",
-            color_discrete_sequence=["#636EFA", "#AB63FA"],
-            text_auto='.2f'
-        )
-        fig_bar.update_layout(showlegend=False)
-        st.plotly_chart(fig_bar, use_container_width=True)
-
-    if auto_refresh:
-        time.sleep(5)
-        st.rerun()
+        st.warning(f"⚠️ 无法连接到统计接口: {e}")
