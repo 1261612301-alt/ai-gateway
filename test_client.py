@@ -1,21 +1,27 @@
-from openai import OpenAI, APIStatusError
+import requests
+import json
 
-client = OpenAI(
-    api_key="anything",
-    base_url="http://127.0.0.1:8000/v1",
-    timeout=120.0,
-    max_retries=0,
-)
+url = "https://ai-gateway-ardy.onrender.com/v1/chat/completions"
+payload = {
+    "model": "gemini-3.1-flash-lite",
+    "messages": [{"role": "user", "content": "请用一句话介绍什么是语义缓存"}],
+    "stream": True  # 开启流式传输
+}
 
-try:
-    response = client.chat.completions.create(
-        model="gemini-3.1-flash-lite",
-        messages=[{"role": "user", "content": "怎么修改微信密码？"}],
-    )
-except APIStatusError as exc:
-    print("HTTP", exc.status_code)
-    print(exc.response.text if exc.response is not None else exc)
-    raise
+print("🤖 正在发送请求...")
+response = requests.post(url, json=payload, stream=True)
 
-print("AI 回答:", response.choices[0].message.content)
-print("gateway_meta:", getattr(response, "gateway_meta", None) or response.model_extra)
+for line in response.iter_lines():
+    if line:
+        decoded = line.decode('utf-8')
+        if decoded.startswith("data: "):
+            data_str = decoded[6:]
+            if data_str == "[DONE]":
+                break
+            try:
+                data = json.loads(data_str)
+                content = data["choices"][0]["delta"].get("content", "")
+                print(content, end="", flush=True)
+            except Exception:
+                pass
+print("\n")

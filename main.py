@@ -1,17 +1,18 @@
-import os
+importimport os
 import time
 import uuid
 import json
 import asyncio
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Security, Request
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse
 from google import genai
 from pydantic import BaseModel, ConfigDict
 from upstash_redis import Redis
 from upstash_vector import Index
 
-# ==================== 1. 配置信息（仅从环境变量读取，禁止硬编码密钥） ====================
+# ==================== 1. 配置信息 ====================
 def require_env(*names: str) -> str:
     for name in names:
         value = os.environ.get(name)
@@ -22,7 +23,6 @@ def require_env(*names: str) -> str:
         f"启动失败：未检测到环境变量 {pretty}。"
         "请在云平台（或本地）配置后再启动服务。"
     )
-
 
 GEMINI_API_KEY = require_env("GEMINI_API_KEY")
 UPSTASH_REDIS_URL = require_env("UPSTASH_REDIS_URL")
@@ -42,20 +42,44 @@ CHAT_FALLBACKS = [
     "gemini-3.8-flash",
 ]
 SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.92"))
-STATS_TOTAL_KEY = "stats:total_requests"
-STATS_HITS_KEY = "stats:cache_hits"
 
 # ==================== 2. 初始化 ====================
 app = FastAPI(
-    title="AI Semantic Cache Gateway API",
-    version="2.1.0",
-    description="基于 Upstash Vector 语义向量检索与流式传输的 AI 降本网关",
+    title="AI Semantic Cache Gateway API - Multi-Tenant",
+    version="2.2.0",
+    description="支持 API Key 多租户隔离、语义检索与流式传输的 AI 降本网关",
 )
 
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
 redis_client = Redis(url=UPSTASH_REDIS_URL, token=UPSTASH_REDIS_TOKEN)
 vector_index = Index(url=UPSTASH_VECTOR_URL, token=UPSTASH_VECTOR_TOKEN)
 _INDEX_DIMENSION: int | None = None
+
+security = HTTPBearer(auto_error=False)
+
+# 模拟多租户 API Key 数据库（实际生产中可存入 Redis 或数据库）
+# 格式: {"api_key": "tenant_name"}
+VALID_CLIENTS = {
+    "sk-gateway-demo001": "企业客户A-电商业务部",
+    "sk-gateway-vip002": "企业客户B-智能客服部",
+    "sk-gateway-free": "免费体验用户"
+}
+
+def get_tenant_by_key(credentials: HTTPAuthorizationCredentials | None) -> str:
+    """验证 API Key 并返回对应的租户名称，未提供或错误则归为默认/或报错"""
+    if not credentials:
+        # 为了兼容前期测试，如果没有传 Bearer Token，暂时归为默认公共租户
+        return "public-default-tenant"
+    
+    token = credentials.credentials
+    if token in VALID_CLIENTS:
+        return VALID_CLIENTS[token]
+    
+    # 如果是以 sk- 开头的新客户 Key，也可以动态放行并自动注册
+    if token.startswith("sk-"):
+        return f"client-{token[-6:]}"
+        
+    raise HTTPException(status_code=401, detail="无效的 API Key，请检查 Authorization 请求头")
 
 
 def get_index_dimension() -> int:
@@ -139,31 +163,7 @@ def query_semantic_cache(query_vector: list[float]):
     return metadata, score
 
 
-def ask_gemini(prompt: str, preferred_model: str) -> tuple[str, str]:
-    candidates: list[str] = []
-    if preferred_model and preferred_model.startswith("gemini") and "2.5" not in preferred_model:
-        candidates.append(preferred_model)
-    for name in CHAT_FALLBACKS:
-        if name not in candidates:
-            candidates.append(name)
-
-    last_error: Exception | None = None
-    for model in candidates:
-        try:
-            completion = ai_client.models.generate_content(model=model, contents=prompt)
-            text = (completion.text or "").strip()
-            if text:
-                return text, model
-        except Exception as exc:
-            last_error = exc
-            text = str(exc).upper()
-            if any(token in text for token in ("404", "NOT_FOUND", "NO LONGER AVAILABLE", "503", "UNAVAILABLE", "429")):
-                continue
-            raise
-    raise RuntimeError(f"Gemini 调用失败: {last_error}")
-
-
-def save_semantic_cache(prompt: str, ai_response: str, query_vector: list[float]) -> None:
+def save_semantic_cache(prompt: str, ai_response: str, query_vector: list[float], tenant: str) -> None:
     vector_index.upsert(
         vectors=[
             {
@@ -173,23 +173,31 @@ def save_semantic_cache(prompt: str, ai_response: str, query_vector: list[float]
                     "prompt": prompt,
                     "response": ai_response,
                     "ai_response": ai_response,
+                    "tenant": tenant
                 },
             }
         ]
     )
 
 
-# ==================== 3. 核心语义缓存路由（支持 Stream 流式传输） ====================
+# ==================== 3. 核心多租户语义缓存路由 ====================
 @app.post("/v1/chat/completions")
-def chat_gateway(request: ChatRequest):
+def chat_gateway(request: ChatRequest, credentials: HTTPAuthorizationCredentials | None = Security(security)):
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages 不能为空")
 
+    tenant_name = get_tenant_by_key(credentials)
     start_time = time.time()
     user_prompt = extract_user_prompt(request.messages)
 
+    # 按租户隔离的 Redis 统计 Key
+    total_key = f"stats:total:{tenant_name}"
+    hits_key = f"stats:hits:{tenant_name}"
+
     try:
-        redis_client.incr(STATS_TOTAL_KEY)
+        redis_client.incr("stats:total_requests")  # 全局总数
+        redis_client.incr(total_key)              # 租户总数
+        
         query_vector = embed_prompt(user_prompt)
         metadata, similarity_score = query_semantic_cache(query_vector)
         cached_response = None
@@ -200,12 +208,12 @@ def chat_gateway(request: ChatRequest):
         # 情况 A：命中语义缓存
         # ----------------------------------------------------
         if cached_response and similarity_score >= SIMILARITY_THRESHOLD:
-            redis_client.incr(STATS_HITS_KEY)
+            redis_client.incr("stats:cache_hits")  # 全局命中
+            redis_client.incr(hits_key)           # 租户命中
             
-            # 如果客户端请求了流式传输 (stream=True)
             if request.stream:
                 async def fake_stream_generator():
-                    chunk_size = 2  # 每次吐 2 个字符，营造丝滑打字机效果
+                    chunk_size = 2
                     for i in range(0, len(cached_response), chunk_size):
                         chunk = cached_response[i:i+chunk_size]
                         chunk_data = {
@@ -230,7 +238,6 @@ def chat_gateway(request: ChatRequest):
 
                 return StreamingResponse(fake_stream_generator(), media_type="text/event-stream")
 
-            # 非流式直接返回
             latency_ms = round((time.time() - start_time) * 1000, 2)
             return {
                 "id": "chatcmpl-gateway",
@@ -245,6 +252,7 @@ def chat_gateway(request: ChatRequest):
                     }
                 ],
                 "gateway_meta": {
+                    "tenant": tenant_name,
                     "cached": True,
                     "similarity": round(similarity_score, 4),
                     "latency_ms": f"{latency_ms} ms",
@@ -255,14 +263,14 @@ def chat_gateway(request: ChatRequest):
         # ----------------------------------------------------
         # 情况 B：未命中缓存，调用大模型
         # ----------------------------------------------------
-        if request.stream:
-            candidates: list[str] = []
-            if request.model and request.model.startswith("gemini") and "2.5" not in request.model:
-                candidates.append(request.model)
-            for name in CHAT_FALLBACKS:
-                if name not in candidates:
-                    candidates.append(name)
+        candidates: list[str] = []
+        if request.model and request.model.startswith("gemini") and "2.5" not in request.model:
+            candidates.append(request.model)
+        for name in CHAT_FALLBACKS:
+            if name not in candidates:
+                candidates.append(name)
 
+        if request.stream:
             async def llm_stream_generator():
                 full_text = ""
                 used_model = request.model
@@ -308,10 +316,9 @@ def chat_gateway(request: ChatRequest):
                     yield "data: [DONE]\n\n"
                     return
 
-                # 传输结束后，自动写入 Upstash Vector 语义缓存
                 if full_text:
                     try:
-                        save_semantic_cache(user_prompt, full_text, query_vector)
+                        save_semantic_cache(user_prompt, full_text, query_vector, tenant_name)
                     except Exception as e:
                         print(f"⚠️ 缓存写入异常: {e}")
 
@@ -327,15 +334,31 @@ def chat_gateway(request: ChatRequest):
 
             return StreamingResponse(llm_stream_generator(), media_type="text/event-stream")
 
-        # 非流式调用 Gemini（保留原逻辑）
-        ai_response, used_model = ask_gemini(user_prompt, request.model)
-        save_semantic_cache(user_prompt, ai_response, query_vector)
+        # 非流式调用 Gemini
+        last_error = None
+        ai_response = ""
+        used_model = request.model
+        for model in candidates:
+            try:
+                completion = ai_client.models.generate_content(model=model, contents=user_prompt)
+                ai_response = (completion.text or "").strip()
+                if ai_response:
+                    used_model = model
+                    break
+            except Exception as exc:
+                last_error = exc
+                continue
+        
+        if not ai_response:
+            raise RuntimeError(f"Gemini 调用失败: {last_error}")
+
+        save_semantic_cache(user_prompt, ai_response, query_vector, tenant_name)
         latency_ms = round((time.time() - start_time) * 1000, 2)
         return {
             "id": "chatcmpl-gateway",
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": used_model or request.model,
+            "model": used_model,
             "choices": [
                 {
                     "index": 0,
@@ -344,6 +367,7 @@ def chat_gateway(request: ChatRequest):
                 }
             ],
             "gateway_meta": {
+                "tenant": tenant_name,
                 "cached": False,
                 "similarity": round(similarity_score, 4),
                 "latency_ms": f"{latency_ms} ms",
@@ -359,13 +383,20 @@ def chat_gateway(request: ChatRequest):
 
 # ==================== 4. 统计与探针 ====================
 @app.get("/stats")
-def get_stats():
+def get_stats(tenant: str | None = None):
+    """获取统计数据。若传入 tenant 参数，则返回该租户的专属数据；否则返回全局数据。"""
     try:
-        total_requests = int(redis_client.get(STATS_TOTAL_KEY) or 0)
-        cache_hits = int(redis_client.get(STATS_HITS_KEY) or 0)
+        if tenant:
+            total_requests = int(redis_client.get(f"stats:total:{tenant}") or 0)
+            cache_hits = int(redis_client.get(f"stats:hits:{tenant}") or 0)
+        else:
+            total_requests = int(redis_client.get("stats:total_requests") or 0)
+            cache_hits = int(redis_client.get("stats:cache_hits") or 0)
+
         hit_rate = f"{round((cache_hits / total_requests) * 100, 2)}%" if total_requests else "0%"
         return {
             "status": "success",
+            "tenant": tenant or "global",
             "metrics": {
                 "total_requests": total_requests,
                 "cache_hits": cache_hits,
@@ -380,9 +411,9 @@ def get_stats():
 @app.get("/")
 def read_root():
     return {
-        "service": "AI Semantic Cache Gateway",
+        "service": "AI Semantic Cache Gateway - Multi-Tenant",
         "status": "ok",
         "docs": "/docs",
         "chat": "POST /v1/chat/completions",
-        "stats": "GET /stats",
+        "stats": "GET /stats?tenant=租户名",
     }
