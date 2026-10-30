@@ -49,4 +49,11 @@ with tab1:
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    for message in st.
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    if prompt := st.chat_input("输入你的问题（例如：公司年假怎么休？）..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
