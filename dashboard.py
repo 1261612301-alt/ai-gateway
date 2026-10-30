@@ -13,7 +13,7 @@ st.set_page_config(
 st.sidebar.title("🔐 租户控制台")
 api_base_url = st.sidebar.text_input(
     "后端网关 API 地址 (Render URL)", 
-    value="https://ai-gateway-ardy.onrender.com"  # 请换成你实际的 Render 网址
+    value="https://ai-gateway-xxxx.onrender.com"  # 请换成你实际的 Render 网址
 ).strip()
 
 api_key = st.sidebar.text_input(
@@ -74,17 +74,3 @@ with tab1:
                 headers = {
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json"
-                }
-                
-                response = requests.post(url, json=payload, headers=headers, stream=True, timeout=30)
-                
-                if response.status_code != 200:
-                    message_placeholder.error(f"网关响应错误 [{response.status_code}]: {response.text}")
-                else:
-                    for line in response.iter_lines():
-                        if line:
-                            decoded = line.decode('utf-8')
-                            if decoded.startswith("data: "):
-                                data_str = decoded[6:]
-                                if data_str == "[DONE]":
-                                    break
