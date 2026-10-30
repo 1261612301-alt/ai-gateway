@@ -10,7 +10,7 @@ import httpx
 from upstash_vector import Index
 from upstash_redis import Redis
 
-app = FastAPI(title="AI Semantic Cache Gateway", version="2.1.0")
+app = FastAPI(title="AI Semantic Cache Gateway", version="2.1.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,7 +28,7 @@ VECTOR_TOKEN = os.getenv("UPSTASH_VECTOR_REST_TOKEN", "")
 REDIS_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
 REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
-# 真实大模型后端配置 (例如 Gemini / DeepSeek 兼容接口)
+# 真实大模型后端配置
 REAL_LLM_API_KEY = os.getenv("REAL_LLM_API_KEY", "")
 REAL_LLM_BASE_URL = os.getenv("REAL_LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
 DEFAULT_CHAT_MODEL = os.getenv("DEFAULT_CHAT_MODEL", "gemini-2.5-flash")
@@ -70,7 +70,7 @@ def update_metrics(tenant: str, hit: bool, saved_cost: float = 0.002):
     except Exception as e:
         print(f"Metrics update error: {e}")
 
-# ==================== 兼容性路由 (防止 DSH 等框架报 404) ====================
+# ==================== 兼容性路由 ====================
 @app.get("/v1/models")
 @app.get("/models")
 @app.get("/v1/v1/models")
@@ -108,14 +108,25 @@ async def handle_chat_completion(request: ChatRequest, tenant: str):
         update_metrics(tenant, hit=True)
         if request.stream:
             async def cached_stream():
+                # 先发内容
                 chunk_data = {
                     "id": "chatcmpl-cached",
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
                     "model": request.model,
-                    "choices": [{"index": 0, "delta": {"content": cached_response}, "finish_reason": "stop"}]
+                    "choices": [{"index": 0, "delta": {"content": cached_response}, "finish_reason": None}]
                 }
                 yield f"data: {json.dumps(chunk_data)}\n\n"
+                
+                # 再发结束标识，满足严格的 finish_reason 校验
+                end_chunk = {
+                    "id": "chatcmpl-cached",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": request.model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                }
+                yield f"data: {json.dumps(end_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
             return StreamingResponse(cached_stream(), media_type="text/event-stream")
         else:
@@ -137,6 +148,7 @@ async def handle_chat_completion(request: ChatRequest, tenant: str):
     
     async def proxy_stream():
         full_content = ""
+        has_sent_finish = False
         async with httpx.AsyncClient(timeout=60.0) as client:
             async with client.stream("POST", f"{REAL_LLM_BASE_URL.rstrip('/')}/chat/completions", json=payload, headers=headers) as response:
                 if response.status_code != 200:
@@ -144,16 +156,35 @@ async def handle_chat_completion(request: ChatRequest, tenant: str):
                     return
                 async for line in response.aiter_lines():
                     if line:
-                        yield line + "\n\n"
                         if line.startswith("data: ") and line[6:].strip() != "[DONE]":
                             try:
                                 data = json.loads(line[6:])
-                                delta = data["choices"][0].get("delta", {})
-                                content = delta.get("content", "")
-                                if content:
-                                    full_content += content
+                                choices = data.get("choices", [])
+                                if choices:
+                                    delta = choices[0].get("delta", {})
+                                    content = delta.get("content", "")
+                                    if content:
+                                        full_content += content
+                                    if choices[0].get("finish_reason"):
+                                        has_sent_finish = True
                             except Exception:
                                 pass
+                            yield line + "\n\n"
+                        elif line.strip() == "data: [DONE]":
+                            # 如果上游没传 finish_reason，在 [DONE] 前补发一个，防止 SDK 报错
+                            if not has_sent_finish:
+                                finish_chunk = {
+                                    "id": "chatcmpl-proxy-end",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": request.model,
+                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                                }
+                                yield f"data: {json.dumps(finish_chunk)}\n\n"
+                            yield line + "\n\n"
+                        else:
+                            yield line + "\n\n"
+                            
         # 异步写入语义缓存
         if vector_index and user_prompt and full_content:
             try:
