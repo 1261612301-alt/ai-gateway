@@ -10,7 +10,7 @@ import httpx
 from upstash_vector import Index
 from upstash_redis import Redis
 
-app = FastAPI(title="AI Semantic Cache Gateway", version="2.1.1")
+app = FastAPI(title="AI Semantic Cache Gateway", version="2.1.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -108,7 +108,6 @@ async def handle_chat_completion(request: ChatRequest, tenant: str):
         update_metrics(tenant, hit=True)
         if request.stream:
             async def cached_stream():
-                # 先发内容
                 chunk_data = {
                     "id": "chatcmpl-cached",
                     "object": "chat.completion.chunk",
@@ -118,7 +117,6 @@ async def handle_chat_completion(request: ChatRequest, tenant: str):
                 }
                 yield f"data: {json.dumps(chunk_data)}\n\n"
                 
-                # 再发结束标识，满足严格的 finish_reason 校验
                 end_chunk = {
                     "id": "chatcmpl-cached",
                     "object": "chat.completion.chunk",
@@ -152,39 +150,47 @@ async def handle_chat_completion(request: ChatRequest, tenant: str):
         async with httpx.AsyncClient(timeout=60.0) as client:
             async with client.stream("POST", f"{REAL_LLM_BASE_URL.rstrip('/')}/chat/completions", json=payload, headers=headers) as response:
                 if response.status_code != 200:
-                    yield f"data: {json.dumps({'error': 'upstream error'})}\n\n"
+                    error_detail = await response.aread()
+                    yield f"data: {json.dumps({'error': error_detail.decode()})}\n\n"
                     return
+                
                 async for line in response.aiter_lines():
-                    if line:
-                        if line.startswith("data: ") and line[6:].strip() != "[DONE]":
-                            try:
-                                data = json.loads(line[6:])
-                                choices = data.get("choices", [])
-                                if choices:
-                                    delta = choices[0].get("delta", {})
-                                    content = delta.get("content", "")
-                                    if content:
-                                        full_content += content
-                                    if choices[0].get("finish_reason"):
-                                        has_sent_finish = True
-                            except Exception:
-                                pass
-                            yield line + "\n\n"
-                        elif line.strip() == "data: [DONE]":
-                            # 如果上游没传 finish_reason，在 [DONE] 前补发一个，防止 SDK 报错
-                            if not has_sent_finish:
-                                finish_chunk = {
-                                    "id": "chatcmpl-proxy-end",
-                                    "object": "chat.completion.chunk",
-                                    "created": int(time.time()),
-                                    "model": request.model,
-                                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-                                }
-                                yield f"data: {json.dumps(finish_chunk)}\n\n"
-                            yield line + "\n\n"
-                        else:
-                            yield line + "\n\n"
-                            
+                    if not line:
+                        continue
+                    line_str = line.strip()
+                    if line_str.startswith("data: "):
+                        data_content = line_str[6:].strip()
+                        if data_content == "[DONE]":
+                            continue
+                        try:
+                            data = json.loads(data_content)
+                            choices = data.get("choices", [])
+                            if choices:
+                                delta = choices[0].get("delta", {})
+                                content = delta.get("content", "")
+                                if content:
+                                    full_content += content
+                                if choices[0].get("finish_reason"):
+                                    has_sent_finish = True
+                        except Exception:
+                            pass
+                        yield f"data: {data_content}\n\n"
+                    else:
+                        yield f"{line_str}\n\n"
+
+        # 强制兜底：确保流结束时一定带有 finish_reason: stop 和 [DONE]
+        if not has_sent_finish:
+            finish_chunk = {
+                "id": "chatcmpl-proxy-end",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": request.model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+            }
+            yield f"data: {json.dumps(finish_chunk)}\n\n"
+        
+        yield "data: [DONE]\n\n"
+            
         # 异步写入语义缓存
         if vector_index and user_prompt and full_content:
             try:
