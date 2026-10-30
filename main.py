@@ -5,12 +5,11 @@ from fastapi import FastAPI, HTTPException, Security, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 import httpx
 from upstash_vector import Index
 from upstash_redis import Redis
 
-app = FastAPI(title="AI Semantic Cache Gateway", version="2.1.2")
+app = FastAPI(title="AI Semantic Cache Gateway", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,7 +21,7 @@ app.add_middleware(
 
 security = HTTPBearer(auto_error=False)
 
-# 初始化 Upstash 客户端 (从环境变量读取)
+# 初始化 Upstash 客户端
 VECTOR_URL = os.getenv("UPSTASH_VECTOR_REST_URL", "")
 VECTOR_TOKEN = os.getenv("UPSTASH_VECTOR_REST_TOKEN", "")
 REDIS_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
@@ -48,12 +47,6 @@ def get_tenant_from_credentials(credentials: HTTPAuthorizationCredentials | None
         return "public-default-tenant"
     token = credentials.credentials
     return API_KEY_TO_TENANT.get(token, f"tenant-{token[-6:]}" if len(token) > 6 else "default-tenant")
-
-class ChatRequest(BaseModel):
-    model: str = DEFAULT_CHAT_MODEL
-    messages: list
-    stream: bool = False
-    temperature: float = 0.7
 
 def update_metrics(tenant: str, hit: bool, saved_cost: float = 0.002):
     if not redis_client:
@@ -85,12 +78,17 @@ def list_models():
         ]
     }
 
-async def handle_chat_completion(request: ChatRequest, tenant: str):
+async def handle_chat_completion(body: dict, tenant: str):
+    # 提取最后一句用户提示词用于语义缓存匹配
+    messages = body.get("messages", [])
     user_prompt = ""
-    for msg in reversed(request.messages):
-        if msg.get("role") == "user":
+    for msg in reversed(messages):
+        if isinstance(msg, dict) and msg.get("role") == "user":
             user_prompt = msg.get("content", "")
             break
+
+    is_stream = body.get("stream", False)
+    model_name = body.get("model", DEFAULT_CHAT_MODEL)
 
     # 1. 尝试语义缓存命中
     cached_response = None
@@ -106,13 +104,13 @@ async def handle_chat_completion(request: ChatRequest, tenant: str):
 
     if cached_response:
         update_metrics(tenant, hit=True)
-        if request.stream:
+        if is_stream:
             async def cached_stream():
                 chunk_data = {
                     "id": "chatcmpl-cached",
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
-                    "model": request.model,
+                    "model": model_name,
                     "choices": [{"index": 0, "delta": {"content": cached_response}, "finish_reason": None}]
                 }
                 yield f"data: {json.dumps(chunk_data)}\n\n"
@@ -121,7 +119,7 @@ async def handle_chat_completion(request: ChatRequest, tenant: str):
                     "id": "chatcmpl-cached",
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
-                    "model": request.model,
+                    "model": model_name,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
                 }
                 yield f"data: {json.dumps(end_chunk)}\n\n"
@@ -132,23 +130,22 @@ async def handle_chat_completion(request: ChatRequest, tenant: str):
                 "id": "chatcmpl-cached",
                 "object": "chat.completion",
                 "created": int(time.time()),
-                "model": request.model,
+                "model": model_name,
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": cached_response}, "finish_reason": "stop"}]
             }
 
-    # 2. 未命中，请求真实大模型
+    # 2. 未命中，全功能透传请求真实大模型
     update_metrics(tenant, hit=False)
     headers = {
         "Authorization": f"Bearer {REAL_LLM_API_KEY}",
         "Content-Type": "application/json"
     }
-    payload = request.dict()
     
     async def proxy_stream():
         full_content = ""
         has_sent_finish = False
         async with httpx.AsyncClient(timeout=60.0) as client:
-            async with client.stream("POST", f"{REAL_LLM_BASE_URL.rstrip('/')}/chat/completions", json=payload, headers=headers) as response:
+            async with client.stream("POST", f"{REAL_LLM_BASE_URL.rstrip('/')}/chat/completions", json=body, headers=headers) as response:
                 if response.status_code != 200:
                     error_detail = await response.aread()
                     yield f"data: {json.dumps({'error': error_detail.decode()})}\n\n"
@@ -178,13 +175,12 @@ async def handle_chat_completion(request: ChatRequest, tenant: str):
                     else:
                         yield f"{line_str}\n\n"
 
-        # 强制兜底：确保流结束时一定带有 finish_reason: stop 和 [DONE]
         if not has_sent_finish:
             finish_chunk = {
                 "id": "chatcmpl-proxy-end",
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
-                "model": request.model,
+                "model": model_name,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
             }
             yield f"data: {json.dumps(finish_chunk)}\n\n"
@@ -204,11 +200,11 @@ async def handle_chat_completion(request: ChatRequest, tenant: str):
             except Exception as e:
                 print(f"Vector upsert error: {e}")
 
-    if request.stream:
+    if is_stream:
         return StreamingResponse(proxy_stream(), media_type="text/event-stream")
     else:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(f"{REAL_LLM_BASE_URL.rstrip('/')}/chat/completions", json=payload, headers=headers)
+            response = await client.post(f"{REAL_LLM_BASE_URL.rstrip('/')}/chat/completions", json=body, headers=headers)
             if response.status_code != 200:
                 raise HTTPException(status_code=response.status_code, detail=response.text)
             data = response.json()
@@ -230,9 +226,13 @@ async def handle_chat_completion(request: ChatRequest, tenant: str):
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
 @app.post("/v1/v1/chat/completions")
-async def chat_completions(request: ChatRequest, credentials: HTTPAuthorizationCredentials | None = Security(security)):
+async def chat_completions(request: Request, credentials: HTTPAuthorizationCredentials | None = Security(security)):
     tenant = get_tenant_from_credentials(credentials)
-    return await handle_chat_completion(request, tenant)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    return await handle_chat_completion(body, tenant)
 
 # ==================== 租户统计接口 ====================
 @app.get("/stats")
