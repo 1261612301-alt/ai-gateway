@@ -13,7 +13,7 @@ st.set_page_config(
 st.sidebar.title("🔐 租户控制台")
 api_base_url = st.sidebar.text_input(
     "后端网关 API 地址 (Render URL)", 
-    value="https://ai-gateway-xxxx.onrender.com"  # 请换成你实际的 Render 网址
+    value="https://ai-gateway-ardy.onrender.com"
 ).strip()
 
 api_key = st.sidebar.text_input(
@@ -23,7 +23,6 @@ api_key = st.sidebar.text_input(
     help="输入你的专属 API Key，例如 sk-gateway-demo001 或 sk-gateway-vip002"
 ).strip()
 
-# 根据输入的 API Key 映射对应的租户名称（用于统计看板查询）
 tenant_mapping = {
     "sk-gateway-demo001": "企业客户A-电商业务部",
     "sk-gateway-vip002": "企业客户B-智能客服部",
@@ -40,7 +39,6 @@ st.sidebar.info(
     "- **极致降本**：高频重复问题省下 100% Token 费用。"
 )
 
-# 主界面 Tabs
 tab1, tab2 = st.tabs(["💬 AI 智能对话测试", "📊 专属降本数据大屏"])
 
 # ==================== Tab 1: AI 智能对话演练场 ====================
@@ -51,26 +49,4 @@ with tab1:
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-
-    if prompt := st.chat_input("输入你的问题（例如：公司年假怎么休？）..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-
-        with st.chat_message("assistant"):
-            message_placeholder = st.empty()
-            full_response = ""
-            
-            try:
-                payload = {
-                    "model": "gemini-3.1-flash-lite",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "stream": True
-                }
-                url = f"{api_base_url.rstrip('/')}/v1/chat/completions"
-                headers = {
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json"
+    for message in st.
