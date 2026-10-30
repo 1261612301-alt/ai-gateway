@@ -417,3 +417,32 @@ def read_root():
         "chat": "POST /v1/chat/completions",
         "stats": "GET /stats?tenant=租户名",
     }
+
+@app.get("/v1/models")
+def list_models():
+    """兼容 OpenAI 协议的模型列表探针，供 DSH 等框架初始化检查"""
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "deepseek-chat",
+                "object": "model",
+                "owned_by": "gateway"
+            },
+            {
+                "id": DEFAULT_CHAT_MODEL,
+                "object": "model",
+                "owned_by": "gateway"
+            },
+            {
+                "id": "gemini-3.1-flash-lite",
+                "object": "model",
+                "owned_by": "gateway"
+            },
+            {
+                "id": "gemini-3.5-flash-lite",
+                "object": "model",
+                "owned_by": "gateway"
+            }
+        ]
+    }
