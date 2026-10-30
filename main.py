@@ -9,7 +9,7 @@ import httpx
 from upstash_vector import Index
 from upstash_redis import Redis
 
-app = FastAPI(title="AI Semantic Cache Gateway", version="2.2.0")
+app = FastAPI(title="AI Semantic Cache Gateway", version="2.2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -88,7 +88,7 @@ async def handle_chat_completion(body: dict, tenant: str):
             break
 
     is_stream = body.get("stream", False)
-    model_name = body.get("model", DEFAULT_CHAT_MODEL)
+    client_model = body.get("model", DEFAULT_CHAT_MODEL)
 
     # 1. 尝试语义缓存命中
     cached_response = None
@@ -110,7 +110,7 @@ async def handle_chat_completion(body: dict, tenant: str):
                     "id": "chatcmpl-cached",
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
-                    "model": model_name,
+                    "model": client_model,
                     "choices": [{"index": 0, "delta": {"content": cached_response}, "finish_reason": None}]
                 }
                 yield f"data: {json.dumps(chunk_data)}\n\n"
@@ -119,7 +119,7 @@ async def handle_chat_completion(body: dict, tenant: str):
                     "id": "chatcmpl-cached",
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
-                    "model": model_name,
+                    "model": client_model,
                     "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
                 }
                 yield f"data: {json.dumps(end_chunk)}\n\n"
@@ -130,25 +130,31 @@ async def handle_chat_completion(body: dict, tenant: str):
                 "id": "chatcmpl-cached",
                 "object": "chat.completion",
                 "created": int(time.time()),
-                "model": model_name,
+                "model": client_model,
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": cached_response}, "finish_reason": "stop"}]
             }
 
-    # 2. 未命中，全功能透传请求真实大模型
+    # 2. 未命中，准备转发给真实大模型
     update_metrics(tenant, hit=False)
     headers = {
         "Authorization": f"Bearer {REAL_LLM_API_KEY}",
         "Content-Type": "application/json"
     }
     
+    # 🔴 核心修复：把上游大模型不认识的模型名（如 deepseek-chat）替换为 Gemini 认识的默认模型
+    upstream_body = body.copy()
+    upstream_body["model"] = DEFAULT_CHAT_MODEL
+    
     async def proxy_stream():
         full_content = ""
         has_sent_finish = False
         async with httpx.AsyncClient(timeout=60.0) as client:
-            async with client.stream("POST", f"{REAL_LLM_BASE_URL.rstrip('/')}/chat/completions", json=body, headers=headers) as response:
+            async with client.stream("POST", f"{REAL_LLM_BASE_URL.rstrip('/')}/chat/completions", json=upstream_body, headers=headers) as response:
                 if response.status_code != 200:
                     error_detail = await response.aread()
-                    yield f"data: {json.dumps({'error': error_detail.decode()})}\n\n"
+                    err_msg = error_detail.decode()
+                    print(f"Upstream error [{response.status_code}]: {err_msg}")
+                    yield f"data: {json.dumps({'error': err_msg})}\n\n"
                     return
                 
                 async for line in response.aiter_lines():
@@ -180,7 +186,7 @@ async def handle_chat_completion(body: dict, tenant: str):
                 "id": "chatcmpl-proxy-end",
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
-                "model": model_name,
+                "model": client_model,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
             }
             yield f"data: {json.dumps(finish_chunk)}\n\n"
@@ -204,7 +210,7 @@ async def handle_chat_completion(body: dict, tenant: str):
         return StreamingResponse(proxy_stream(), media_type="text/event-stream")
     else:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(f"{REAL_LLM_BASE_URL.rstrip('/')}/chat/completions", json=body, headers=headers)
+            response = await client.post(f"{REAL_LLM_BASE_URL.rstrip('/')}/chat/completions", json=upstream_body, headers=headers)
             if response.status_code != 200:
                 raise HTTPException(status_code=response.status_code, detail=response.text)
             data = response.json()
