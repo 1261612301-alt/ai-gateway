@@ -9,7 +9,7 @@ import httpx
 from upstash_vector import Index
 from upstash_redis import Redis
 
-app = FastAPI(title="AI Semantic Cache Gateway", version="2.2.1")
+app = FastAPI(title="AI Semantic Cache Gateway", version="2.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,10 +27,10 @@ VECTOR_TOKEN = os.getenv("UPSTASH_VECTOR_REST_TOKEN", "")
 REDIS_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
 REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
-# 真实大模型后端配置
+# 真实大模型后端配置 (默认直连 DeepSeek 官方)
 REAL_LLM_API_KEY = os.getenv("REAL_LLM_API_KEY", "")
-REAL_LLM_BASE_URL = os.getenv("REAL_LLM_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
-DEFAULT_CHAT_MODEL = os.getenv("DEFAULT_CHAT_MODEL", "gemini-2.5-flash")
+REAL_LLM_BASE_URL = os.getenv("REAL_LLM_BASE_URL", "https://api.deepseek.com")
+DEFAULT_CHAT_MODEL = os.getenv("DEFAULT_CHAT_MODEL", "deepseek-chat")
 
 vector_index = Index(url=VECTOR_URL, token=VECTOR_TOKEN) if VECTOR_URL and VECTOR_TOKEN else None
 redis_client = Redis(url=REDIS_URL, token=REDIS_TOKEN) if REDIS_URL and REDIS_TOKEN else None
@@ -72,14 +72,12 @@ def list_models():
         "object": "list",
         "data": [
             {"id": "deepseek-chat", "object": "model", "owned_by": "gateway"},
-            {"id": DEFAULT_CHAT_MODEL, "object": "model", "owned_by": "gateway"},
-            {"id": "gemini-3.1-flash-lite", "object": "model", "owned_by": "gateway"},
-            {"id": "gemini-2.5-flash", "object": "model", "owned_by": "gateway"}
+            {"id": "deepseek-coder", "object": "model", "owned_by": "gateway"},
+            {"id": DEFAULT_CHAT_MODEL, "object": "model", "owned_by": "gateway"}
         ]
     }
 
 async def handle_chat_completion(body: dict, tenant: str):
-    # 提取最后一句用户提示词用于语义缓存匹配
     messages = body.get("messages", [])
     user_prompt = ""
     for msg in reversed(messages):
@@ -134,26 +132,22 @@ async def handle_chat_completion(body: dict, tenant: str):
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": cached_response}, "finish_reason": "stop"}]
             }
 
-    # 2. 未命中，准备转发给真实大模型
+    # 2. 未命中，转发给 DeepSeek 官方大模型
     update_metrics(tenant, hit=False)
     headers = {
         "Authorization": f"Bearer {REAL_LLM_API_KEY}",
         "Content-Type": "application/json"
     }
     
-    # 🔴 核心修复：把上游大模型不认识的模型名（如 deepseek-chat）替换为 Gemini 认识的默认模型
-    upstream_body = body.copy()
-    upstream_body["model"] = DEFAULT_CHAT_MODEL
-    
     async def proxy_stream():
         full_content = ""
         has_sent_finish = False
         async with httpx.AsyncClient(timeout=60.0) as client:
-            async with client.stream("POST", f"{REAL_LLM_BASE_URL.rstrip('/')}/chat/completions", json=upstream_body, headers=headers) as response:
+            async with client.stream("POST", f"{REAL_LLM_BASE_URL.rstrip('/')}/chat/completions", json=body, headers=headers) as response:
                 if response.status_code != 200:
                     error_detail = await response.aread()
                     err_msg = error_detail.decode()
-                    print(f"Upstream error [{response.status_code}]: {err_msg}")
+                    print(f"Upstream DeepSeek error [{response.status_code}]: {err_msg}")
                     yield f"data: {json.dumps({'error': err_msg})}\n\n"
                     return
                 
@@ -210,7 +204,7 @@ async def handle_chat_completion(body: dict, tenant: str):
         return StreamingResponse(proxy_stream(), media_type="text/event-stream")
     else:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(f"{REAL_LLM_BASE_URL.rstrip('/')}/chat/completions", json=upstream_body, headers=headers)
+            response = await client.post(f"{REAL_LLM_BASE_URL.rstrip('/')}/chat/completions", json=body, headers=headers)
             if response.status_code != 200:
                 raise HTTPException(status_code=response.status_code, detail=response.text)
             data = response.json()
