@@ -9,7 +9,7 @@ import httpx
 from upstash_vector import Index
 from upstash_redis import Redis
 
-app = FastAPI(title="AI Semantic Cache Gateway", version="2.3.0")
+app = FastAPI(title="AI Semantic Cache Gateway", version="2.3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,13 +21,11 @@ app.add_middleware(
 
 security = HTTPBearer(auto_error=False)
 
-# 初始化 Upstash 客户端
 VECTOR_URL = os.getenv("UPSTASH_VECTOR_REST_URL", "")
 VECTOR_TOKEN = os.getenv("UPSTASH_VECTOR_REST_TOKEN", "")
 REDIS_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
 REDIS_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
-# 真实大模型后端配置 (默认直连 DeepSeek 官方)
 REAL_LLM_API_KEY = os.getenv("REAL_LLM_API_KEY", "")
 REAL_LLM_BASE_URL = os.getenv("REAL_LLM_BASE_URL", "https://api.deepseek.com")
 DEFAULT_CHAT_MODEL = os.getenv("DEFAULT_CHAT_MODEL", "deepseek-chat")
@@ -35,7 +33,6 @@ DEFAULT_CHAT_MODEL = os.getenv("DEFAULT_CHAT_MODEL", "deepseek-chat")
 vector_index = Index(url=VECTOR_URL, token=VECTOR_TOKEN) if VECTOR_URL and VECTOR_TOKEN else None
 redis_client = Redis(url=REDIS_URL, token=REDIS_TOKEN) if REDIS_URL and REDIS_TOKEN else None
 
-# API Key 与租户映射关系
 API_KEY_TO_TENANT = {
     "sk-gateway-demo001": "企业客户A-电商业务部",
     "sk-gateway-vip002": "企业客户B-智能客服部",
@@ -50,6 +47,7 @@ def get_tenant_from_credentials(credentials: HTTPAuthorizationCredentials | None
 
 def update_metrics(tenant: str, hit: bool, saved_cost: float = 0.002):
     if not redis_client:
+        print("❌ Redis client not initialized!")
         return
     try:
         total_key = f"tenant:{tenant}:total_requests"
@@ -60,10 +58,10 @@ def update_metrics(tenant: str, hit: bool, saved_cost: float = 0.002):
         if hit:
             redis_client.incr(hits_key)
             redis_client.incrbyfloat(cost_key, saved_cost)
+        print(f"✅ Metrics updated successfully for tenant [{tenant}] | Hit: {hit}")
     except Exception as e:
-        print(f"Metrics update error: {e}")
+        print(f"🔥 Metrics update error: {e}")
 
-# ==================== 兼容性路由 ====================
 @app.get("/v1/models")
 @app.get("/models")
 @app.get("/v1/v1/models")
@@ -132,7 +130,7 @@ async def handle_chat_completion(body: dict, tenant: str):
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": cached_response}, "finish_reason": "stop"}]
             }
 
-    # 2. 未命中，转发给 DeepSeek 官方大模型
+    # 2. 未命中，转发给 DeepSeek 官方
     update_metrics(tenant, hit=False)
     headers = {
         "Authorization": f"Bearer {REAL_LLM_API_KEY}",
@@ -187,7 +185,6 @@ async def handle_chat_completion(body: dict, tenant: str):
         
         yield "data: [DONE]\n\n"
             
-        # 异步写入语义缓存
         if vector_index and user_prompt and full_content:
             try:
                 vector_index.upsert(
@@ -222,7 +219,6 @@ async def handle_chat_completion(body: dict, tenant: str):
                 pass
             return data
 
-# ==================== 多路径对话核心路由 ====================
 @app.post("/v1/chat/completions")
 @app.post("/chat/completions")
 @app.post("/v1/v1/chat/completions")
@@ -234,7 +230,6 @@ async def chat_completions(request: Request, credentials: HTTPAuthorizationCrede
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
     return await handle_chat_completion(body, tenant)
 
-# ==================== 租户统计接口 ====================
 @app.get("/stats")
 def get_stats(tenant: str = "public-default-tenant"):
     if not redis_client:
