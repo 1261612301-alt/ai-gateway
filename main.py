@@ -10,7 +10,7 @@ import httpx
 from upstash_vector import Index
 from upstash_redis import Redis
 
-app = FastAPI(title="AI Semantic Cache Gateway - SaaS Multi-Tenant Edition", version="2.8.0")
+app = FastAPI(title="AI Semantic Cache Gateway - SaaS Multi-Tenant Edition", version="2.9.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,48 +34,38 @@ DEFAULT_CHAT_MODEL = os.getenv("DEFAULT_CHAT_MODEL", "deepseek-chat")
 vector_index = Index(url=VECTOR_URL, token=VECTOR_TOKEN) if VECTOR_URL and VECTOR_TOKEN else None
 redis_client = Redis(url=REDIS_URL, token=REDIS_TOKEN) if REDIS_URL and REDIS_TOKEN else None
 
-# 🟢 启动时自动初始化默认租户到 Redis（确保你当前的 DSH 测试不受影响）
 def init_default_tenants():
     if not redis_client:
         return
     defaults = {
         "sk-gateway-demo001": {"name": "企业客户A-电商业务部", "plan": "pro", "expires_at": 9999999999},
         "sk-gateway-vip002": {"name": "企业客户B-智能客服部", "plan": "pro", "expires_at": 9999999999},
-        "sk-gateway-free": {"name": "免费体验用户", "plan": "trial", "expires_at": 9999999999}
+        "sk-gateway-free": {"name": "免费体验用户", "plan": "trial", "expires_at": 9999999999},
+        "sk-gw-client-vip888": {"name": "某某科技创新公司", "plan": "pro", "expires_at": 9999999999}
     }
     for key, info in defaults.items():
         redis_key = f"gateway:key:{key}"
         if not redis_client.exists(redis_key):
             redis_client.set(redis_key, json.dumps(info))
 
-# 执行初始化
 init_default_tenants()
 
-# 🟢 动态从 Redis 校验租户身份
 def get_tenant_from_credentials(credentials: HTTPAuthorizationCredentials | None) -> str:
     if not credentials:
         return "public-default-tenant"
     token = credentials.credentials
-    
     if not redis_client:
         return "default-tenant"
-    
     try:
         tenant_data_str = redis_client.get(f"gateway:key:{token}")
         if not tenant_data_str:
-            # 如果 Key 不存在，检查是否是临时未知 Key，给个默认归属或拒绝
             return f"tenant-{token[-6:]}" if len(token) > 6 else "unknown-tenant"
-        
-        # 兼容 Redis 返回字典或字符串
         if isinstance(tenant_data_str, str):
             tenant_info = json.loads(tenant_data_str)
         else:
             tenant_info = tenant_data_str
-            
-        # 检查是否过期
         if tenant_info.get("expires_at", 0) < time.time():
-            raise HTTPException(status_code=403, detail="API Key has expired. Please renew your subscription.")
-            
+            raise HTTPException(status_code=403, detail="API Key has expired.")
         return tenant_info.get("name", "paid-tenant")
     except HTTPException as he:
         raise he
@@ -87,16 +77,13 @@ def calculate_saved_cost(model_name: str, prompt_tokens: int, completion_tokens:
     utc_now = datetime.now(timezone.utc)
     hour_decimal = utc_now.hour + utc_now.minute / 60.0
     is_peak = 9.5 <= hour_decimal <= 23.5
-    
     is_pro = "pro" in model_name.lower() or "coder" in model_name.lower()
-    
     if is_pro:
         input_rate = 9.0 if is_peak else 4.5
         output_rate = 27.0 if is_peak else 13.5
     else:
         input_rate = 2.0 if is_peak else 1.0
         output_rate = 8.0 if is_peak else 4.0
-        
     cost = (prompt_tokens * input_rate + completion_tokens * output_rate) / 1_000_000
     return round(cost, 6)
 
@@ -107,7 +94,6 @@ def update_metrics(tenant: str, hit: bool, saved_cost: float = 0.0):
         total_key = f"tenant:{tenant}:total_requests"
         hits_key = f"tenant:{tenant}:cache_hits"
         cost_key = f"tenant:{tenant}:saved_cost"
-        
         redis_client.incr(total_key)
         if hit:
             redis_client.incr(hits_key)
@@ -131,7 +117,6 @@ def list_models():
 
 async def handle_chat_completion(body: dict, tenant: str):
     messages = body.get("messages", [])
-    
     is_agent_loop = any(
         isinstance(msg, dict) and msg.get("role") in ["tool", "function"] 
         for msg in messages
@@ -152,16 +137,19 @@ async def handle_chat_completion(body: dict, tenant: str):
     is_stream = body.get("stream", False)
     client_model = body.get("model", DEFAULT_CHAT_MODEL)
 
-    # 1. 尝试语义缓存命中
+    # 1. 尝试语义缓存命中 (放宽阈值为 0.90，大幅提升命中率)
     cached_data = None
     if vector_index and user_prompt and not is_agent_loop:
         try:
             results = vector_index.query(data=user_prompt, top_k=1, include_metadata=True)
-            if results and results[0].score >= 0.95:
+            if results and results[0].score >= 0.90:
                 meta = results[0].metadata
                 if meta and meta.get("tenant") == tenant:
                     cached_data = meta
-                    print(f"🎯 Cache HIT for tenant [{tenant}] prompt: '{user_prompt}'")
+                    print(f"🎯 Cache HIT for tenant [{tenant}] prompt: '{user_prompt}' (Score: {results[0].score})")
+            else:
+                score_val = results[0].score if results else 0.0
+                print(f"🔍 Cache MISS (Score {score_val:.2f} < 0.90) for prompt: '{user_prompt}'")
         except Exception as e:
             print(f"Vector search error: {e}")
 
@@ -186,7 +174,6 @@ async def handle_chat_completion(body: dict, tenant: str):
                 delta_payload = {}
                 if assistant_message.get("content"):
                     delta_payload["content"] = assistant_message["content"]
-                
                 if has_tools:
                     formatted_tool_calls = []
                     for idx, tc in enumerate(assistant_message["tool_calls"]):
@@ -377,25 +364,30 @@ async def chat_completions(request: Request, credentials: HTTPAuthorizationCrede
 @app.get("/stats")
 def get_stats(tenant: str = "public-default-tenant"):
     if not redis_client:
-        return {"metrics": {"total_requests": 0, "cache_hits": 0, "hit_rate": "0%", "estimated_saved_cost": "¥0.00"}}
+        return {"metrics": {"total_requests": 0, "cache_hits": 0, "cache_misses": 0, "hit_rate": "0%", "miss_rate": "0%", "estimated_saved_cost": "¥0.00"}}
     try:
         total = int(redis_client.get(f"tenant:{tenant}:total_requests") or 0)
         hits = int(redis_client.get(f"tenant:{tenant}:cache_hits") or 0)
+        misses = max(0, total - hits)
         cost = float(redis_client.get(f"tenant:{tenant}:saved_cost") or 0.0)
+        
         hit_rate = f"{(hits / total * 100):.1f}%" if total > 0 else "0%"
+        miss_rate = f"{(misses / total * 100):.1f}%" if total > 0 else "0%"
+        
         return {
             "tenant": tenant,
             "metrics": {
                 "total_requests": total,
                 "cache_hits": hits,
+                "cache_misses": misses,
                 "hit_rate": hit_rate,
+                "miss_rate": miss_rate,
                 "estimated_saved_cost": f"¥{cost:.4f}"
             }
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# 🟢 额外提供一个管理接口：允许 SaaS 后台动态创建新客户的 Key
 @app.post("/admin/create_tenant")
 def create_tenant(api_key: str, name: str, plan: str = "pro", days_valid: int = 30):
     if not redis_client:
