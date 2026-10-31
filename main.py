@@ -10,7 +10,7 @@ import httpx
 from upstash_vector import Index
 from upstash_redis import Redis
 
-app = FastAPI(title="AI Semantic Cache Gateway - SaaS Multi-Tenant Edition", version="2.9.0")
+app = FastAPI(title="AI Semantic Cache Gateway - SaaS Multi-Tenant Edition", version="2.9.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -70,7 +70,7 @@ def get_tenant_from_credentials(credentials: HTTPAuthorizationCredentials | None
     except HTTPException as he:
         raise he
     except Exception as e:
-        print(f"Auth error: {e}")
+        print(f"🔥 Auth error: {e}")
         return "default-tenant"
 
 def calculate_saved_cost(model_name: str, prompt_tokens: int, completion_tokens: int) -> float:
@@ -98,7 +98,7 @@ def update_metrics(tenant: str, hit: bool, saved_cost: float = 0.0):
         if hit:
             redis_client.incr(hits_key)
             redis_client.incrbyfloat(cost_key, saved_cost)
-        print(f"✅ Metrics updated for [{tenant}] | Hit: {hit} | Saved: ¥{saved_cost:.4f}")
+        print(f"📊 Metrics updated for [{tenant}] | Hit: {hit} | Saved: ¥{saved_cost:.4f}")
     except Exception as e:
         print(f"🔥 Metrics update error: {e}")
 
@@ -117,11 +117,8 @@ def list_models():
 
 async def handle_chat_completion(body: dict, tenant: str):
     messages = body.get("messages", [])
-    is_agent_loop = any(
-        isinstance(msg, dict) and msg.get("role") in ["tool", "function"] 
-        for msg in messages
-    )
-
+    
+    # 提取用户输入的 Prompt
     user_prompt = ""
     for msg in reversed(messages):
         if isinstance(msg, dict) and msg.get("role") == "user":
@@ -134,10 +131,16 @@ async def handle_chat_completion(body: dict, tenant: str):
                         user_prompt = part.get("text", "")
             break
 
+    # 检查是否为 Agent 工具循环的最后一步
+    last_message = messages[-1] if messages else {}
+    is_agent_loop = isinstance(last_message, dict) and last_message.get("role") in ["tool", "function"]
+
     is_stream = body.get("stream", False)
     client_model = body.get("model", DEFAULT_CHAT_MODEL)
 
-    # 1. 尝试语义缓存命中 (放宽阈值为 0.90，大幅提升命中率)
+    print(f"📥 收到请求 [租户: {tenant}] | Prompt: '{user_prompt[:50]}...' | Stream: {is_stream} | AgentLoop: {is_agent_loop}")
+
+    # 1. 尝试语义缓存命中
     cached_data = None
     if vector_index and user_prompt and not is_agent_loop:
         try:
@@ -151,7 +154,9 @@ async def handle_chat_completion(body: dict, tenant: str):
                 score_val = results[0].score if results else 0.0
                 print(f"🔍 Cache MISS (Score {score_val:.2f} < 0.90) for prompt: '{user_prompt}'")
         except Exception as e:
-            print(f"Vector search error: {e}")
+            print(f"🔥 Vector search error: {e}")
+    else:
+        print(f"⏭️ 跳过语义检索 (vector_index有效: {bool(vector_index)}, 有效Prompt: {bool(user_prompt)}, 非AgentLoop: {not is_agent_loop})")
 
     if cached_data:
         assistant_message_json = cached_data.get("assistant_message")
@@ -231,7 +236,7 @@ async def handle_chat_completion(body: dict, tenant: str):
                 if response.status_code != 200:
                     error_detail = await response.aread()
                     err_msg = error_detail.decode()
-                    print(f"Upstream DeepSeek error [{response.status_code}]: {err_msg}")
+                    print(f"🔥 Upstream DeepSeek error [{response.status_code}]: {err_msg}")
                     yield f"data: {json.dumps({'error': err_msg})}\n\n"
                     return
                 
@@ -290,7 +295,9 @@ async def handle_chat_completion(body: dict, tenant: str):
         
         yield "data: [DONE]\n\n"
             
-        if vector_index and user_prompt and not is_agent_loop:
+        # 流式传输结束后的缓存写入逻辑
+        print(f"📝 准备写入向量检查 [租户: {tenant}] -> user_prompt: '{user_prompt}', is_agent_loop: {is_agent_loop}")
+        if vector_index and user_prompt:
             assistant_msg = {"role": "assistant"}
             if full_content:
                 assistant_msg["content"] = full_content
@@ -316,7 +323,11 @@ async def handle_chat_completion(body: dict, tenant: str):
                     )
                     print(f"💾 Cached successfully for tenant [{tenant}] (P:{p_tokens}, C:{c_tokens})")
                 except Exception as e:
-                    print(f"Vector upsert error: {e}")
+                    print(f"🔥 Vector upsert error: {e}")
+            else:
+                print("⚠️ assistant_msg 内容为空，放弃缓存写入")
+        else:
+            print(f"⚠️ 跳过写入缓存：vector_index有效={bool(vector_index)}, 有效Prompt={bool(user_prompt)}")
 
     if is_stream:
         return StreamingResponse(proxy_stream(), media_type="text/event-stream")
@@ -333,7 +344,8 @@ async def handle_chat_completion(body: dict, tenant: str):
                 p_tokens = usage.get("prompt_tokens", max(100, len(user_prompt) // 2))
                 c_tokens = usage.get("completion_tokens", max(50, len(message.get("content", "")) // 2))
 
-                if vector_index and user_prompt and not is_agent_loop:
+                print(f"📝 非流式请求准备写入向量 [租户: {tenant}] -> user_prompt: '{user_prompt}'")
+                if vector_index and user_prompt:
                     vector_index.upsert(
                         vectors=[{
                             "id": f"t-{tenant}-{int(time.time()*1000)}",
@@ -346,8 +358,9 @@ async def handle_chat_completion(body: dict, tenant: str):
                             }
                         }]
                     )
+                    print(f"💾 Non-stream Cached successfully for tenant [{tenant}]")
             except Exception as e:
-                print(f"Non-stream cache upsert error: {e}")
+                print(f"🔥 Non-stream cache upsert error: {e}")
             return data
 
 @app.post("/v1/chat/completions")
