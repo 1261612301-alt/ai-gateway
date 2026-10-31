@@ -9,7 +9,7 @@ import httpx
 from upstash_vector import Index
 from upstash_redis import Redis
 
-app = FastAPI(title="AI Semantic Cache Gateway", version="2.4.0")
+app = FastAPI(title="AI Semantic Cache Gateway", version="2.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -83,7 +83,6 @@ async def handle_chat_completion(body: dict, tenant: str):
             if isinstance(content_field, str):
                 user_prompt = content_field
             elif isinstance(content_field, list):
-                # 兼容多模态或富文本消息
                 for part in content_field:
                     if isinstance(part, dict) and part.get("type") == "text":
                         user_prompt = part.get("text", "")
@@ -111,14 +110,26 @@ async def handle_chat_completion(body: dict, tenant: str):
         except Exception:
             assistant_message = {"role": "assistant", "content": cached_message_json}
 
+        has_tools = bool(assistant_message.get("tool_calls"))
+        proper_finish_reason = "tool_calls" if has_tools else "stop"
+
         if is_stream:
             async def cached_stream():
-                # 构造兼容流式输出，支持 content 和 tool_calls
                 delta_payload = {}
                 if assistant_message.get("content"):
                     delta_payload["content"] = assistant_message["content"]
-                if assistant_message.get("tool_calls"):
-                    delta_payload["tool_calls"] = assistant_message["tool_calls"]
+                
+                if has_tools:
+                    # 格式化流式 tool_calls 增量，必须带 index
+                    formatted_tool_calls = []
+                    for idx, tc in enumerate(assistant_message["tool_calls"]):
+                        formatted_tool_calls.append({
+                            "index": idx,
+                            "id": tc.get("id", f"call_cached_{idx}"),
+                            "type": tc.get("type", "function"),
+                            "function": tc.get("function", {})
+                        })
+                    delta_payload["tool_calls"] = formatted_tool_calls
 
                 chunk_data = {
                     "id": "chatcmpl-cached",
@@ -134,7 +145,7 @@ async def handle_chat_completion(body: dict, tenant: str):
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
                     "model": client_model,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": proper_finish_reason}]
                 }
                 yield f"data: {json.dumps(end_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
@@ -145,7 +156,7 @@ async def handle_chat_completion(body: dict, tenant: str):
                 "object": "chat.completion",
                 "created": int(time.time()),
                 "model": client_model,
-                "choices": [{"index": 0, "message": assistant_message, "finish_reason": "stop"}]
+                "choices": [{"index": 0, "message": assistant_message, "finish_reason": proper_finish_reason}]
             }
 
     # 2. 未命中，转发给 DeepSeek 官方
@@ -186,7 +197,6 @@ async def handle_chat_completion(body: dict, tenant: str):
                                 if content:
                                     full_content += content
                                 
-                                # 收集流式传输中的 tool_calls
                                 t_calls = delta.get("tool_calls")
                                 if t_calls:
                                     for tc in t_calls:
@@ -210,18 +220,18 @@ async def handle_chat_completion(body: dict, tenant: str):
                         yield f"{line_str}\n\n"
 
         if not has_sent_finish:
+            finish_reason_fallback = "tool_calls" if collected_tool_calls else "stop"
             finish_chunk = {
                 "id": "chatcmpl-proxy-end",
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
                 "model": client_model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason_fallback}]
             }
             yield f"data: {json.dumps(finish_chunk)}\n\n"
         
         yield "data: [DONE]\n\n"
             
-        # 异步写入语义缓存：支持同时缓存文本和工具调用指令
         if vector_index and user_prompt:
             assistant_msg = {"role": "assistant"}
             if full_content:
@@ -279,7 +289,7 @@ async def chat_completions(request: Request, credentials: HTTPAuthorizationCrede
     try:
         body = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+        raise HTTPException(status_count=400, detail="Invalid JSON payload")
     return await handle_chat_completion(body, tenant)
 
 @app.get("/stats")
