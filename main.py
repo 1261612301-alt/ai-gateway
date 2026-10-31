@@ -1,6 +1,7 @@
 import os
 import json
 import time
+from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Security, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse
@@ -9,7 +10,7 @@ import httpx
 from upstash_vector import Index
 from upstash_redis import Redis
 
-app = FastAPI(title="AI Semantic Cache Gateway", version="2.6.0")
+app = FastAPI(title="AI Semantic Cache Gateway", version="2.7.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,7 +46,26 @@ def get_tenant_from_credentials(credentials: HTTPAuthorizationCredentials | None
     token = credentials.credentials
     return API_KEY_TO_TENANT.get(token, f"tenant-{token[-6:]}" if len(token) > 6 else "default-tenant")
 
-def update_metrics(tenant: str, hit: bool, saved_cost: float = 0.002):
+# 🟢 根据 DeepSeek 最新官方定价表计算精准节省金额（单位：元 RMB）
+def calculate_saved_cost(model_name: str, prompt_tokens: int, completion_tokens: int) -> float:
+    utc_now = datetime.now(timezone.utc)
+    hour_decimal = utc_now.hour + utc_now.minute / 60.0
+    # 高峰时段定义：UTC 09:30 ~ 23:30 (北京时间 17:30 ~ 次日 07:30)
+    is_peak = 9.5 <= hour_decimal <= 23.5
+    
+    is_pro = "pro" in model_name.lower() or "coder" in model_name.lower()
+    
+    if is_pro:
+        input_rate = 9.0 if is_peak else 4.5       # 元 / 百万 tokens (缓存未命中输入)
+        output_rate = 27.0 if is_peak else 13.5    # 元 / 百万 tokens (输出)
+    else:
+        input_rate = 2.0 if is_peak else 1.0       # 元 / 百万 tokens (缓存未命中输入)
+        output_rate = 8.0 if is_peak else 4.0      # 元 / 百万 tokens (输出)
+        
+    cost = (prompt_tokens * input_rate + completion_tokens * output_rate) / 1_000_000
+    return round(cost, 6)
+
+def update_metrics(tenant: str, hit: bool, saved_cost: float = 0.0):
     if not redis_client:
         return
     try:
@@ -57,7 +77,7 @@ def update_metrics(tenant: str, hit: bool, saved_cost: float = 0.002):
         if hit:
             redis_client.incr(hits_key)
             redis_client.incrbyfloat(cost_key, saved_cost)
-        print(f"✅ Metrics updated successfully for tenant [{tenant}] | Hit: {hit}")
+        print(f"✅ Metrics updated for [{tenant}] | Hit: {hit} | Saved: ¥{saved_cost:.4f}")
     except Exception as e:
         print(f"🔥 Metrics update error: {e}")
 
@@ -69,7 +89,7 @@ def list_models():
         "object": "list",
         "data": [
             {"id": "deepseek-chat", "object": "model", "owned_by": "gateway"},
-            {"id": "deepseek-coder", "object": "model", "owned_by": "gateway"},
+            {"id": "deepseek-pro", "object": "model", "owned_by": "gateway"},
             {"id": DEFAULT_CHAT_MODEL, "object": "model", "owned_by": "gateway"}
         ]
     }
@@ -77,7 +97,6 @@ def list_models():
 async def handle_chat_completion(body: dict, tenant: str):
     messages = body.get("messages", [])
     
-    # 🔴 核心修复：检查当前请求是否处于 Agent 多轮工具交互循环中（包含 tool / function 响应）
     is_agent_loop = any(
         isinstance(msg, dict) and msg.get("role") in ["tool", "function"] 
         for msg in messages
@@ -98,25 +117,32 @@ async def handle_chat_completion(body: dict, tenant: str):
     is_stream = body.get("stream", False)
     client_model = body.get("model", DEFAULT_CHAT_MODEL)
 
-    # 1. 尝试语义缓存命中 (只有在非 Agent 循环的第一轮请求时才允许命中缓存)
-    cached_message_json = None
+    # 1. 尝试语义缓存命中
+    cached_data = None
     if vector_index and user_prompt and not is_agent_loop:
         try:
             results = vector_index.query(data=user_prompt, top_k=1, include_metadata=True)
-            if results and results[0].score >= 0.95: # 提高一点相似度阈值，确保精准
+            if results and results[0].score >= 0.95:
                 meta = results[0].metadata
                 if meta and meta.get("tenant") == tenant:
-                    cached_message_json = meta.get("assistant_message")
+                    cached_data = meta
                     print(f"🎯 Cache HIT for prompt: '{user_prompt}'")
         except Exception as e:
             print(f"Vector search error: {e}")
 
-    if cached_message_json:
-        update_metrics(tenant, hit=True)
+    if cached_data:
+        assistant_message_json = cached_data.get("assistant_message")
+        prompt_tokens = int(cached_data.get("prompt_tokens", 500))
+        completion_tokens = int(cached_data.get("completion_tokens", 200))
+        
+        # 计算本次缓存命中所节省的精准人民币金额
+        saved_amount = calculate_saved_cost(client_model, prompt_tokens, completion_tokens)
+        update_metrics(tenant, hit=True, saved_cost=saved_amount)
+
         try:
-            assistant_message = json.loads(cached_message_json)
+            assistant_message = json.loads(assistant_message_json)
         except Exception:
-            assistant_message = {"role": "assistant", "content": cached_message_json}
+            assistant_message = {"role": "assistant", "content": assistant_message_json}
 
         has_tools = bool(assistant_message.get("tool_calls"))
         proper_finish_reason = "tool_calls" if has_tools else "stop"
@@ -166,8 +192,8 @@ async def handle_chat_completion(body: dict, tenant: str):
                 "choices": [{"index": 0, "message": assistant_message, "finish_reason": proper_finish_reason}]
             }
 
-    # 2. 未命中，或者正在进行 Agent 工具循环，直接透传给 DeepSeek 官方
-    update_metrics(tenant, hit=False)
+    # 2. 未命中，转发给 DeepSeek 官方
+    update_metrics(tenant, hit=False, saved_cost=0.0)
     headers = {
         "Authorization": f"Bearer {REAL_LLM_API_KEY}",
         "Content-Type": "application/json"
@@ -177,6 +203,7 @@ async def handle_chat_completion(body: dict, tenant: str):
         full_content = ""
         collected_tool_calls = {}
         has_sent_finish = False
+        prompt_tokens_est = max(100, len(user_prompt) // 2)
         
         async with httpx.AsyncClient(timeout=60.0) as client:
             async with client.stream("POST", f"{REAL_LLM_BASE_URL.rstrip('/')}/chat/completions", json=body, headers=headers) as response:
@@ -197,6 +224,11 @@ async def handle_chat_completion(body: dict, tenant: str):
                             continue
                         try:
                             data = json.loads(data_content)
+                            # 如果上游返回了 usage
+                            if "usage" in data and data["usage"]:
+                                nonlocal prompt_tokens_est
+                                prompt_tokens_est = data["usage"].get("prompt_tokens", prompt_tokens_est)
+
                             choices = data.get("choices", [])
                             if choices:
                                 delta = choices[0].get("delta", {})
@@ -239,13 +271,15 @@ async def handle_chat_completion(body: dict, tenant: str):
         
         yield "data: [DONE]\n\n"
             
-        # 只有在非 Agent 循环的第一轮请求完成时，才把最终结果存入缓存
+        # 写入向量缓存，顺便记录 Token 数量
         if vector_index and user_prompt and not is_agent_loop:
             assistant_msg = {"role": "assistant"}
             if full_content:
                 assistant_msg["content"] = full_content
             if collected_tool_calls:
                 assistant_msg["tool_calls"] = list(collected_tool_calls.values())
+
+            completion_tokens_est = max(50, len(full_content) // 2)
 
             if assistant_msg.get("content") or assistant_msg.get("tool_calls"):
                 try:
@@ -255,11 +289,13 @@ async def handle_chat_completion(body: dict, tenant: str):
                             "data": user_prompt,
                             "metadata": {
                                 "tenant": tenant, 
-                                "assistant_message": json.dumps(assistant_msg, ensure_ascii=False)
+                                "assistant_message": json.dumps(assistant_msg, ensure_ascii=False),
+                                "prompt_tokens": prompt_tokens_est,
+                                "completion_tokens": completion_tokens_est
                             }
                         }]
                     )
-                    print(f"💾 Successfully cached response for tenant [{tenant}]")
+                    print(f"💾 Cached successfully with tokens (P:{prompt_tokens_est}, C:{completion_tokens_est})")
                 except Exception as e:
                     print(f"Vector upsert error: {e}")
 
@@ -274,6 +310,10 @@ async def handle_chat_completion(body: dict, tenant: str):
             try:
                 choice = data["choices"][0]
                 message = choice.get("message", {})
+                usage = data.get("usage", {})
+                p_tokens = usage.get("prompt_tokens", max(100, len(user_prompt) // 2))
+                c_tokens = usage.get("completion_tokens", max(50, len(message.get("content", "")) // 2))
+
                 if vector_index and user_prompt and not is_agent_loop:
                     vector_index.upsert(
                         vectors=[{
@@ -281,7 +321,9 @@ async def handle_chat_completion(body: dict, tenant: str):
                             "data": user_prompt,
                             "metadata": {
                                 "tenant": tenant, 
-                                "assistant_message": json.dumps(message, ensure_ascii=False)
+                                "assistant_message": json.dumps(message, ensure_ascii=False),
+                                "prompt_tokens": p_tokens,
+                                "completion_tokens": c_tokens
                             }
                         }]
                     )
@@ -303,7 +345,7 @@ async def chat_completions(request: Request, credentials: HTTPAuthorizationCrede
 @app.get("/stats")
 def get_stats(tenant: str = "public-default-tenant"):
     if not redis_client:
-        return {"metrics": {"total_requests": 0, "cache_hits": 0, "hit_rate": "0%", "estimated_saved_cost": "$0.00"}}
+        return {"metrics": {"total_requests": 0, "cache_hits": 0, "hit_rate": "0%", "estimated_saved_cost": "¥0.00"}}
     try:
         total = int(redis_client.get(f"tenant:{tenant}:total_requests") or 0)
         hits = int(redis_client.get(f"tenant:{tenant}:cache_hits") or 0)
@@ -315,7 +357,7 @@ def get_stats(tenant: str = "public-default-tenant"):
                 "total_requests": total,
                 "cache_hits": hits,
                 "hit_rate": hit_rate,
-                "estimated_saved_cost": f"${cost:.4f}"
+                "estimated_saved_cost": f"¥{cost:.4f}"
             }
         }
     except Exception as e:
