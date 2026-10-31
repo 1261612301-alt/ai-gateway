@@ -9,7 +9,7 @@ import httpx
 from upstash_vector import Index
 from upstash_redis import Redis
 
-app = FastAPI(title="AI Semantic Cache Gateway", version="2.5.0")
+app = FastAPI(title="AI Semantic Cache Gateway", version="2.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -76,6 +76,13 @@ def list_models():
 
 async def handle_chat_completion(body: dict, tenant: str):
     messages = body.get("messages", [])
+    
+    # 🔴 核心修复：检查当前请求是否处于 Agent 多轮工具交互循环中（包含 tool / function 响应）
+    is_agent_loop = any(
+        isinstance(msg, dict) and msg.get("role") in ["tool", "function"] 
+        for msg in messages
+    )
+
     user_prompt = ""
     for msg in reversed(messages):
         if isinstance(msg, dict) and msg.get("role") == "user":
@@ -91,15 +98,16 @@ async def handle_chat_completion(body: dict, tenant: str):
     is_stream = body.get("stream", False)
     client_model = body.get("model", DEFAULT_CHAT_MODEL)
 
-    # 1. 尝试语义缓存命中
+    # 1. 尝试语义缓存命中 (只有在非 Agent 循环的第一轮请求时才允许命中缓存)
     cached_message_json = None
-    if vector_index and user_prompt:
+    if vector_index and user_prompt and not is_agent_loop:
         try:
             results = vector_index.query(data=user_prompt, top_k=1, include_metadata=True)
-            if results and results[0].score >= 0.92:
+            if results and results[0].score >= 0.95: # 提高一点相似度阈值，确保精准
                 meta = results[0].metadata
                 if meta and meta.get("tenant") == tenant:
                     cached_message_json = meta.get("assistant_message")
+                    print(f"🎯 Cache HIT for prompt: '{user_prompt}'")
         except Exception as e:
             print(f"Vector search error: {e}")
 
@@ -120,7 +128,6 @@ async def handle_chat_completion(body: dict, tenant: str):
                     delta_payload["content"] = assistant_message["content"]
                 
                 if has_tools:
-                    # 格式化流式 tool_calls 增量，必须带 index
                     formatted_tool_calls = []
                     for idx, tc in enumerate(assistant_message["tool_calls"]):
                         formatted_tool_calls.append({
@@ -159,7 +166,7 @@ async def handle_chat_completion(body: dict, tenant: str):
                 "choices": [{"index": 0, "message": assistant_message, "finish_reason": proper_finish_reason}]
             }
 
-    # 2. 未命中，转发给 DeepSeek 官方
+    # 2. 未命中，或者正在进行 Agent 工具循环，直接透传给 DeepSeek 官方
     update_metrics(tenant, hit=False)
     headers = {
         "Authorization": f"Bearer {REAL_LLM_API_KEY}",
@@ -232,7 +239,8 @@ async def handle_chat_completion(body: dict, tenant: str):
         
         yield "data: [DONE]\n\n"
             
-        if vector_index and user_prompt:
+        # 只有在非 Agent 循环的第一轮请求完成时，才把最终结果存入缓存
+        if vector_index and user_prompt and not is_agent_loop:
             assistant_msg = {"role": "assistant"}
             if full_content:
                 assistant_msg["content"] = full_content
@@ -251,7 +259,7 @@ async def handle_chat_completion(body: dict, tenant: str):
                             }
                         }]
                     )
-                    print(f"💾 Successfully cached response with tool_calls for tenant [{tenant}]")
+                    print(f"💾 Successfully cached response for tenant [{tenant}]")
                 except Exception as e:
                     print(f"Vector upsert error: {e}")
 
@@ -266,7 +274,7 @@ async def handle_chat_completion(body: dict, tenant: str):
             try:
                 choice = data["choices"][0]
                 message = choice.get("message", {})
-                if vector_index and user_prompt:
+                if vector_index and user_prompt and not is_agent_loop:
                     vector_index.upsert(
                         vectors=[{
                             "id": f"t-{tenant}-{int(time.time()*1000)}",
@@ -289,7 +297,7 @@ async def chat_completions(request: Request, credentials: HTTPAuthorizationCrede
     try:
         body = await request.json()
     except Exception:
-        raise HTTPException(status_count=400, detail="Invalid JSON payload")
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
     return await handle_chat_completion(body, tenant)
 
 @app.get("/stats")
