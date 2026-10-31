@@ -10,7 +10,7 @@ import httpx
 from upstash_vector import Index
 from upstash_redis import Redis
 
-app = FastAPI(title="AI Semantic Cache Gateway", version="2.7.0")
+app = FastAPI(title="AI Semantic Cache Gateway", version="2.7.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -46,21 +46,19 @@ def get_tenant_from_credentials(credentials: HTTPAuthorizationCredentials | None
     token = credentials.credentials
     return API_KEY_TO_TENANT.get(token, f"tenant-{token[-6:]}" if len(token) > 6 else "default-tenant")
 
-# 🟢 根据 DeepSeek 最新官方定价表计算精准节省金额（单位：元 RMB）
 def calculate_saved_cost(model_name: str, prompt_tokens: int, completion_tokens: int) -> float:
     utc_now = datetime.now(timezone.utc)
     hour_decimal = utc_now.hour + utc_now.minute / 60.0
-    # 高峰时段定义：UTC 09:30 ~ 23:30 (北京时间 17:30 ~ 次日 07:30)
     is_peak = 9.5 <= hour_decimal <= 23.5
     
     is_pro = "pro" in model_name.lower() or "coder" in model_name.lower()
     
     if is_pro:
-        input_rate = 9.0 if is_peak else 4.5       # 元 / 百万 tokens (缓存未命中输入)
-        output_rate = 27.0 if is_peak else 13.5    # 元 / 百万 tokens (输出)
+        input_rate = 9.0 if is_peak else 4.5
+        output_rate = 27.0 if is_peak else 13.5
     else:
-        input_rate = 2.0 if is_peak else 1.0       # 元 / 百万 tokens (缓存未命中输入)
-        output_rate = 8.0 if is_peak else 4.0      # 元 / 百万 tokens (输出)
+        input_rate = 2.0 if is_peak else 1.0
+        output_rate = 8.0 if is_peak else 4.0
         
     cost = (prompt_tokens * input_rate + completion_tokens * output_rate) / 1_000_000
     return round(cost, 6)
@@ -135,7 +133,6 @@ async def handle_chat_completion(body: dict, tenant: str):
         prompt_tokens = int(cached_data.get("prompt_tokens", 500))
         completion_tokens = int(cached_data.get("completion_tokens", 200))
         
-        # 计算本次缓存命中所节省的精准人民币金额
         saved_amount = calculate_saved_cost(client_model, prompt_tokens, completion_tokens)
         update_metrics(tenant, hit=True, saved_cost=saved_amount)
 
@@ -203,7 +200,7 @@ async def handle_chat_completion(body: dict, tenant: str):
         full_content = ""
         collected_tool_calls = {}
         has_sent_finish = False
-        prompt_tokens_est = max(100, len(user_prompt) // 2)
+        token_tracker = {"prompt": max(100, len(user_prompt) // 2)}
         
         async with httpx.AsyncClient(timeout=60.0) as client:
             async with client.stream("POST", f"{REAL_LLM_BASE_URL.rstrip('/')}/chat/completions", json=body, headers=headers) as response:
@@ -224,10 +221,8 @@ async def handle_chat_completion(body: dict, tenant: str):
                             continue
                         try:
                             data = json.loads(data_content)
-                            # 如果上游返回了 usage
                             if "usage" in data and data["usage"]:
-                                nonlocal prompt_tokens_est
-                                prompt_tokens_est = data["usage"].get("prompt_tokens", prompt_tokens_est)
+                                token_tracker["prompt"] = data["usage"].get("prompt_tokens", token_tracker["prompt"])
 
                             choices = data.get("choices", [])
                             if choices:
@@ -271,7 +266,6 @@ async def handle_chat_completion(body: dict, tenant: str):
         
         yield "data: [DONE]\n\n"
             
-        # 写入向量缓存，顺便记录 Token 数量
         if vector_index and user_prompt and not is_agent_loop:
             assistant_msg = {"role": "assistant"}
             if full_content:
@@ -279,7 +273,8 @@ async def handle_chat_completion(body: dict, tenant: str):
             if collected_tool_calls:
                 assistant_msg["tool_calls"] = list(collected_tool_calls.values())
 
-            completion_tokens_est = max(50, len(full_content) // 2)
+            p_tokens = token_tracker["prompt"]
+            c_tokens = max(50, len(full_content) // 2)
 
             if assistant_msg.get("content") or assistant_msg.get("tool_calls"):
                 try:
@@ -290,12 +285,12 @@ async def handle_chat_completion(body: dict, tenant: str):
                             "metadata": {
                                 "tenant": tenant, 
                                 "assistant_message": json.dumps(assistant_msg, ensure_ascii=False),
-                                "prompt_tokens": prompt_tokens_est,
-                                "completion_tokens": completion_tokens_est
+                                "prompt_tokens": p_tokens,
+                                "completion_tokens": c_tokens
                             }
                         }]
                     )
-                    print(f"💾 Cached successfully with tokens (P:{prompt_tokens_est}, C:{completion_tokens_est})")
+                    print(f"💾 Cached successfully with tokens (P:{p_tokens}, C:{c_tokens})")
                 except Exception as e:
                     print(f"Vector upsert error: {e}")
 
