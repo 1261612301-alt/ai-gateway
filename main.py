@@ -9,7 +9,7 @@ import httpx
 from upstash_vector import Index
 from upstash_redis import Redis
 
-app = FastAPI(title="AI Semantic Cache Gateway", version="2.3.2")
+app = FastAPI(title="AI Semantic Cache Gateway", version="2.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,7 +21,6 @@ app.add_middleware(
 
 security = HTTPBearer(auto_error=False)
 
-# 🟢 双重兼容：同时支持带 _REST_ 和不带 _REST_ 的环境变量名
 VECTOR_URL = os.getenv("UPSTASH_VECTOR_URL", "") or os.getenv("UPSTASH_VECTOR_REST_URL", "")
 VECTOR_TOKEN = os.getenv("UPSTASH_VECTOR_TOKEN", "") or os.getenv("UPSTASH_VECTOR_REST_TOKEN", "")
 REDIS_URL = os.getenv("UPSTASH_REDIS_URL", "") or os.getenv("UPSTASH_REDIS_REST_URL", "")
@@ -48,7 +47,6 @@ def get_tenant_from_credentials(credentials: HTTPAuthorizationCredentials | None
 
 def update_metrics(tenant: str, hit: bool, saved_cost: float = 0.002):
     if not redis_client:
-        print("❌ Redis client not initialized!")
         return
     try:
         total_key = f"tenant:{tenant}:total_requests"
@@ -81,34 +79,53 @@ async def handle_chat_completion(body: dict, tenant: str):
     user_prompt = ""
     for msg in reversed(messages):
         if isinstance(msg, dict) and msg.get("role") == "user":
-            user_prompt = msg.get("content", "")
+            content_field = msg.get("content", "")
+            if isinstance(content_field, str):
+                user_prompt = content_field
+            elif isinstance(content_field, list):
+                # 兼容多模态或富文本消息
+                for part in content_field:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        user_prompt = part.get("text", "")
             break
 
     is_stream = body.get("stream", False)
     client_model = body.get("model", DEFAULT_CHAT_MODEL)
 
     # 1. 尝试语义缓存命中
-    cached_response = None
+    cached_message_json = None
     if vector_index and user_prompt:
         try:
             results = vector_index.query(data=user_prompt, top_k=1, include_metadata=True)
             if results and results[0].score >= 0.92:
                 meta = results[0].metadata
                 if meta and meta.get("tenant") == tenant:
-                    cached_response = meta.get("response")
+                    cached_message_json = meta.get("assistant_message")
         except Exception as e:
             print(f"Vector search error: {e}")
 
-    if cached_response:
+    if cached_message_json:
         update_metrics(tenant, hit=True)
+        try:
+            assistant_message = json.loads(cached_message_json)
+        except Exception:
+            assistant_message = {"role": "assistant", "content": cached_message_json}
+
         if is_stream:
             async def cached_stream():
+                # 构造兼容流式输出，支持 content 和 tool_calls
+                delta_payload = {}
+                if assistant_message.get("content"):
+                    delta_payload["content"] = assistant_message["content"]
+                if assistant_message.get("tool_calls"):
+                    delta_payload["tool_calls"] = assistant_message["tool_calls"]
+
                 chunk_data = {
                     "id": "chatcmpl-cached",
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
                     "model": client_model,
-                    "choices": [{"index": 0, "delta": {"content": cached_response}, "finish_reason": None}]
+                    "choices": [{"index": 0, "delta": delta_payload, "finish_reason": None}]
                 }
                 yield f"data: {json.dumps(chunk_data)}\n\n"
                 
@@ -128,7 +145,7 @@ async def handle_chat_completion(body: dict, tenant: str):
                 "object": "chat.completion",
                 "created": int(time.time()),
                 "model": client_model,
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": cached_response}, "finish_reason": "stop"}]
+                "choices": [{"index": 0, "message": assistant_message, "finish_reason": "stop"}]
             }
 
     # 2. 未命中，转发给 DeepSeek 官方
@@ -140,7 +157,9 @@ async def handle_chat_completion(body: dict, tenant: str):
     
     async def proxy_stream():
         full_content = ""
+        collected_tool_calls = {}
         has_sent_finish = False
+        
         async with httpx.AsyncClient(timeout=60.0) as client:
             async with client.stream("POST", f"{REAL_LLM_BASE_URL.rstrip('/')}/chat/completions", json=body, headers=headers) as response:
                 if response.status_code != 200:
@@ -166,6 +185,22 @@ async def handle_chat_completion(body: dict, tenant: str):
                                 content = delta.get("content", "")
                                 if content:
                                     full_content += content
+                                
+                                # 收集流式传输中的 tool_calls
+                                t_calls = delta.get("tool_calls")
+                                if t_calls:
+                                    for tc in t_calls:
+                                        idx = tc.get("index", 0)
+                                        if idx not in collected_tool_calls:
+                                            collected_tool_calls[idx] = {"id": tc.get("id"), "type": tc.get("type", "function"), "function": {"name": "", "arguments": ""}}
+                                        if tc.get("id"):
+                                            collected_tool_calls[idx]["id"] = tc.get("id")
+                                        func = tc.get("function", {})
+                                        if func.get("name"):
+                                            collected_tool_calls[idx]["function"]["name"] += func.get("name")
+                                        if func.get("arguments"):
+                                            collected_tool_calls[idx]["function"]["arguments"] += func.get("arguments")
+
                                 if choices[0].get("finish_reason"):
                                     has_sent_finish = True
                         except Exception:
@@ -186,17 +221,29 @@ async def handle_chat_completion(body: dict, tenant: str):
         
         yield "data: [DONE]\n\n"
             
-        if vector_index and user_prompt and full_content:
-            try:
-                vector_index.upsert(
-                    vectors=[{
-                        "id": f"t-{tenant}-{int(time.time()*1000)}",
-                        "data": user_prompt,
-                        "metadata": {"tenant": tenant, "response": full_content}
-                    }]
-                )
-            except Exception as e:
-                print(f"Vector upsert error: {e}")
+        # 异步写入语义缓存：支持同时缓存文本和工具调用指令
+        if vector_index and user_prompt:
+            assistant_msg = {"role": "assistant"}
+            if full_content:
+                assistant_msg["content"] = full_content
+            if collected_tool_calls:
+                assistant_msg["tool_calls"] = list(collected_tool_calls.values())
+
+            if assistant_msg.get("content") or assistant_msg.get("tool_calls"):
+                try:
+                    vector_index.upsert(
+                        vectors=[{
+                            "id": f"t-{tenant}-{int(time.time()*1000)}",
+                            "data": user_prompt,
+                            "metadata": {
+                                "tenant": tenant, 
+                                "assistant_message": json.dumps(assistant_msg, ensure_ascii=False)
+                            }
+                        }]
+                    )
+                    print(f"💾 Successfully cached response with tool_calls for tenant [{tenant}]")
+                except Exception as e:
+                    print(f"Vector upsert error: {e}")
 
     if is_stream:
         return StreamingResponse(proxy_stream(), media_type="text/event-stream")
@@ -207,17 +254,21 @@ async def handle_chat_completion(body: dict, tenant: str):
                 raise HTTPException(status_code=response.status_code, detail=response.text)
             data = response.json()
             try:
-                full_content = data["choices"][0]["message"]["content"]
-                if vector_index and user_prompt and full_content:
+                choice = data["choices"][0]
+                message = choice.get("message", {})
+                if vector_index and user_prompt:
                     vector_index.upsert(
                         vectors=[{
                             "id": f"t-{tenant}-{int(time.time()*1000)}",
                             "data": user_prompt,
-                            "metadata": {"tenant": tenant, "response": full_content}
+                            "metadata": {
+                                "tenant": tenant, 
+                                "assistant_message": json.dumps(message, ensure_ascii=False)
+                            }
                         }]
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Non-stream cache upsert error: {e}")
             return data
 
 @app.post("/v1/chat/completions")
