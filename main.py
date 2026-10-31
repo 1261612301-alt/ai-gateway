@@ -10,7 +10,7 @@ import httpx
 from upstash_vector import Index
 from upstash_redis import Redis
 
-app = FastAPI(title="AI Semantic Cache Gateway", version="2.7.1")
+app = FastAPI(title="AI Semantic Cache Gateway - SaaS Multi-Tenant Edition", version="2.8.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,17 +34,54 @@ DEFAULT_CHAT_MODEL = os.getenv("DEFAULT_CHAT_MODEL", "deepseek-chat")
 vector_index = Index(url=VECTOR_URL, token=VECTOR_TOKEN) if VECTOR_URL and VECTOR_TOKEN else None
 redis_client = Redis(url=REDIS_URL, token=REDIS_TOKEN) if REDIS_URL and REDIS_TOKEN else None
 
-API_KEY_TO_TENANT = {
-    "sk-gateway-demo001": "企业客户A-电商业务部",
-    "sk-gateway-vip002": "企业客户B-智能客服部",
-    "sk-gateway-free": "免费体验用户"
-}
+# 🟢 启动时自动初始化默认租户到 Redis（确保你当前的 DSH 测试不受影响）
+def init_default_tenants():
+    if not redis_client:
+        return
+    defaults = {
+        "sk-gateway-demo001": {"name": "企业客户A-电商业务部", "plan": "pro", "expires_at": 9999999999},
+        "sk-gateway-vip002": {"name": "企业客户B-智能客服部", "plan": "pro", "expires_at": 9999999999},
+        "sk-gateway-free": {"name": "免费体验用户", "plan": "trial", "expires_at": 9999999999}
+    }
+    for key, info in defaults.items():
+        redis_key = f"gateway:key:{key}"
+        if not redis_client.exists(redis_key):
+            redis_client.set(redis_key, json.dumps(info))
 
+# 执行初始化
+init_default_tenants()
+
+# 🟢 动态从 Redis 校验租户身份
 def get_tenant_from_credentials(credentials: HTTPAuthorizationCredentials | None) -> str:
     if not credentials:
         return "public-default-tenant"
     token = credentials.credentials
-    return API_KEY_TO_TENANT.get(token, f"tenant-{token[-6:]}" if len(token) > 6 else "default-tenant")
+    
+    if not redis_client:
+        return "default-tenant"
+    
+    try:
+        tenant_data_str = redis_client.get(f"gateway:key:{token}")
+        if not tenant_data_str:
+            # 如果 Key 不存在，检查是否是临时未知 Key，给个默认归属或拒绝
+            return f"tenant-{token[-6:]}" if len(token) > 6 else "unknown-tenant"
+        
+        # 兼容 Redis 返回字典或字符串
+        if isinstance(tenant_data_str, str):
+            tenant_info = json.loads(tenant_data_str)
+        else:
+            tenant_info = tenant_data_str
+            
+        # 检查是否过期
+        if tenant_info.get("expires_at", 0) < time.time():
+            raise HTTPException(status_code=403, detail="API Key has expired. Please renew your subscription.")
+            
+        return tenant_info.get("name", "paid-tenant")
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"Auth error: {e}")
+        return "default-tenant"
 
 def calculate_saved_cost(model_name: str, prompt_tokens: int, completion_tokens: int) -> float:
     utc_now = datetime.now(timezone.utc)
@@ -124,7 +161,7 @@ async def handle_chat_completion(body: dict, tenant: str):
                 meta = results[0].metadata
                 if meta and meta.get("tenant") == tenant:
                     cached_data = meta
-                    print(f"🎯 Cache HIT for prompt: '{user_prompt}'")
+                    print(f"🎯 Cache HIT for tenant [{tenant}] prompt: '{user_prompt}'")
         except Exception as e:
             print(f"Vector search error: {e}")
 
@@ -290,7 +327,7 @@ async def handle_chat_completion(body: dict, tenant: str):
                             }
                         }]
                     )
-                    print(f"💾 Cached successfully with tokens (P:{p_tokens}, C:{c_tokens})")
+                    print(f"💾 Cached successfully for tenant [{tenant}] (P:{p_tokens}, C:{c_tokens})")
                 except Exception as e:
                     print(f"Vector upsert error: {e}")
 
@@ -355,5 +392,18 @@ def get_stats(tenant: str = "public-default-tenant"):
                 "estimated_saved_cost": f"¥{cost:.4f}"
             }
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# 🟢 额外提供一个管理接口：允许 SaaS 后台动态创建新客户的 Key
+@app.post("/admin/create_tenant")
+def create_tenant(api_key: str, name: str, plan: str = "pro", days_valid: int = 30):
+    if not redis_client:
+        raise HTTPException(status_code=500, detail="Redis not connected")
+    try:
+        expires_at = time.time() + (days_valid * 86400)
+        tenant_info = {"name": name, "plan": plan, "expires_at": expires_at}
+        redis_client.set(f"gateway:key:{api_key}", json.dumps(tenant_info))
+        return {"status": "success", "message": f"Tenant {name} created successfully", "api_key": api_key, "expires_at": expires_at}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
