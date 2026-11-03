@@ -10,7 +10,7 @@ import httpx
 from upstash_vector import Index
 from upstash_redis import Redis
 
-app = FastAPI(title="AI Agent Strict Tool-Signature Gateway", version="3.5.1")
+app = FastAPI(title="AI Agent Strict Tool-Signature Gateway", version="3.5.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -130,15 +130,42 @@ async def handle_chat_completion(body: dict, tenant: str):
                         user_prompt = part.get("text", "")
             break
 
+    # 🛑 核心过滤：识别并跳过 DSH 客户端的后台系统辅助请求（如自动生成标题、时间戳采样等）
+    background_keywords = [
+        "Generate the session title", 
+        "Time sampled while preparing", 
+        "session title from this JSON"
+    ]
+    is_background_system_prompt = any(kw in user_prompt for kw in background_keywords)
+
+    if is_background_system_prompt:
+        print(f"🛡️ 拦截并放行 DSH 后台系统辅助请求，不走缓存: '{user_prompt[:40]}...'")
+        headers = {
+            "Authorization": f"Bearer {REAL_LLM_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        if body.get("stream", False):
+            async def background_proxy_stream():
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    async with client.stream("POST", f"{REAL_LLM_BASE_URL.rstrip('/')}/chat/completions", json=body, headers=headers) as response:
+                        async for line in response.aiter_lines():
+                            if line:
+                                yield f"{line}\n\n"
+            return StreamingResponse(background_proxy_stream(), media_type="text/event-stream")
+        else:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(f"{REAL_LLM_BASE_URL.rstrip('/')}/chat/completions", json=body, headers=headers)
+                return response.json()
+
     last_message = messages[-1] if messages else {}
     is_agent_loop = isinstance(last_message, dict) and last_message.get("role") in ["tool", "function"]
 
     is_stream = body.get("stream", False)
     client_model = body.get("model", DEFAULT_CHAT_MODEL)
 
-    print(f"📥 收到请求 [租户: {tenant}] | Prompt: '{user_prompt[:50]}...' | AgentLoop: {is_agent_loop}")
+    print(f"📥 收到业务请求 [租户: {tenant}] | Prompt: '{user_prompt[:50]}...' | AgentLoop: {is_agent_loop}")
 
-    # 1. 严格阈值匹配 (从 0.75 提高至 0.88，彻底杜绝误命中)
+    # 1. 严格阈值匹配 (>= 0.88)
     cached_data = None
     if vector_index and user_prompt and not is_agent_loop:
         try:
@@ -151,7 +178,7 @@ async def handle_chat_completion(body: dict, tenant: str):
                     print(f"🎯 [STRICT HIT] 成功命中缓存！租户 [{tenant}] | 得分: {results[0].score:.2f} | 匹配向量ID: {matched_id}")
             else:
                 score_val = results[0].score if results else 0.0
-                print(f"🔍 Cache MISS (严格阈值检查: 最高得分 {score_val:.2f} < 0.88) for prompt: '{user_prompt}'")
+                print(f"🔍 Cache MISS (最高得分 {score_val:.2f} < 0.88) for prompt: '{user_prompt}'")
         except Exception as e:
             print(f"🔥 Vector search error: {e}")
     else:
@@ -217,7 +244,7 @@ async def handle_chat_completion(body: dict, tenant: str):
                 "choices": [{"index": 0, "message": assistant_message, "finish_reason": proper_finish_reason}]
             }
 
-    # 2. 未命中，正常走官方代理
+    # 2. 未命中，转发给 DeepSeek 官方
     update_metrics(tenant, hit=False, saved_cost=0.0)
     headers = {
         "Authorization": f"Bearer {REAL_LLM_API_KEY}",
