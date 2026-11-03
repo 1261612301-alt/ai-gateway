@@ -10,7 +10,7 @@ import httpx
 from upstash_vector import Index
 from upstash_redis import Redis
 
-app = FastAPI(title="AI Agent Strict Tool-Signature Gateway", version="3.5.2")
+app = FastAPI(title="AI Agent Step-Level Tool Cache Gateway", version="3.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -118,76 +118,68 @@ def list_models():
 async def handle_chat_completion(body: dict, tenant: str):
     messages = body.get("messages", [])
     
-    user_prompt = ""
+    # 提取当前激活的子任务意图（取 messages 中最新的用户发言或最后一条局部指令）
+    current_step_query = ""
     for msg in reversed(messages):
-        if isinstance(msg, dict) and msg.get("role") == "user":
+        if isinstance(msg, dict) and msg.get("role") in ["user", "tool"]:
             content_field = msg.get("content", "")
-            if isinstance(content_field, str):
-                user_prompt = content_field
+            if isinstance(content_field, str) and content_field.strip():
+                current_step_query = content_field
+                break
             elif isinstance(content_field, list):
                 for part in content_field:
                     if isinstance(part, dict) and part.get("type") == "text":
-                        user_prompt = part.get("text", "")
-            break
+                        current_step_query = part.get("text", "")
+                        break
+            if current_step_query:
+                break
 
-    # 🛑 核心过滤：识别并跳过 DSH 客户端的后台系统辅助请求（如自动生成标题、时间戳采样等）
+    # 🛑 过滤 DSH 后台系统辅助请求
     background_keywords = [
         "Generate the session title", 
         "Time sampled while preparing", 
         "session title from this JSON"
     ]
-    is_background_system_prompt = any(kw in user_prompt for kw in background_keywords)
-
-    if is_background_system_prompt:
-        print(f"🛡️ 拦截并放行 DSH 后台系统辅助请求，不走缓存: '{user_prompt[:40]}...'")
-        headers = {
-            "Authorization": f"Bearer {REAL_LLM_API_KEY}",
-            "Content-Type": "application/json"
-        }
+    if any(kw in current_step_query for kw in background_keywords):
+        print(f"🛡️ 拦截并放行后台系统辅助请求: '{current_step_query[:40]}...'")
+        headers = {"Authorization": f"Bearer {REAL_LLM_API_KEY}", "Content-Type": "application/json"}
         if body.get("stream", False):
-            async def background_proxy_stream():
+            async def bg_stream():
                 async with httpx.AsyncClient(timeout=60.0) as client:
                     async with client.stream("POST", f"{REAL_LLM_BASE_URL.rstrip('/')}/chat/completions", json=body, headers=headers) as response:
                         async for line in response.aiter_lines():
-                            if line:
-                                yield f"{line}\n\n"
-            return StreamingResponse(background_proxy_stream(), media_type="text/event-stream")
+                            if line: yield f"{line}\n\n"
+            return StreamingResponse(bg_stream(), media_type="text/event-stream")
         else:
             async with httpx.AsyncClient(timeout=60.0) as client:
-                response = await client.post(f"{REAL_LLM_BASE_URL.rstrip('/')}/chat/completions", json=body, headers=headers)
-                return response.json()
-
-    last_message = messages[-1] if messages else {}
-    is_agent_loop = isinstance(last_message, dict) and last_message.get("role") in ["tool", "function"]
+                res = await client.post(f"{REAL_LLM_BASE_URL.rstrip('/')}/chat/completions", json=body, headers=headers)
+                return res.json()
 
     is_stream = body.get("stream", False)
     client_model = body.get("model", DEFAULT_CHAT_MODEL)
 
-    print(f"📥 收到业务请求 [租户: {tenant}] | Prompt: '{user_prompt[:50]}...' | AgentLoop: {is_agent_loop}")
+    print(f"📥 收到步骤级请求 [租户: {tenant}] | Query片段: '{current_step_query[:50]}...'")
 
-    # 1. 严格阈值匹配 (>= 0.88)
+    # 1. 步骤级原子向量检索 (阈值设为 0.82，兼顾灵活性与准确度)
     cached_data = None
-    if vector_index and user_prompt and not is_agent_loop:
+    if vector_index and current_step_query:
         try:
-            results = vector_index.query(data=user_prompt, top_k=1, include_metadata=True)
-            if results and results[0].score >= 0.88:
+            results = vector_index.query(data=current_step_query, top_k=1, include_metadata=True)
+            if results and results[0].score >= 0.82:
                 meta = results[0].metadata
                 if meta and meta.get("tenant") == tenant:
                     cached_data = meta
-                    matched_id = results[0].id
-                    print(f"🎯 [STRICT HIT] 成功命中缓存！租户 [{tenant}] | 得分: {results[0].score:.2f} | 匹配向量ID: {matched_id}")
+                    print(f"🎯 [STEP-LEVEL HIT] 成功命中原子工具步骤！租户 [{tenant}] | 得分: {results[0].score:.2f} | 绑定工具: {meta.get('tool_names')}")
             else:
                 score_val = results[0].score if results else 0.0
-                print(f"🔍 Cache MISS (最高得分 {score_val:.2f} < 0.88) for prompt: '{user_prompt}'")
+                print(f"🔍 Step Cache MISS (最高得分 {score_val:.2f} < 0.82)")
         except Exception as e:
             print(f"🔥 Vector search error: {e}")
-    else:
-        print(f"⏭️ 跳过语义检索 (有效Prompt: {bool(user_prompt)}, 非AgentLoop: {not is_agent_loop})")
 
     if cached_data:
         assistant_message_json = cached_data.get("assistant_message")
-        prompt_tokens = int(cached_data.get("prompt_tokens", 1000))
-        completion_tokens = int(cached_data.get("completion_tokens", 300))
+        prompt_tokens = int(cached_data.get("prompt_tokens", 600))
+        completion_tokens = int(cached_data.get("completion_tokens", 150))
         
         saved_amount = calculate_saved_cost(client_model, prompt_tokens, completion_tokens)
         update_metrics(tenant, hit=True, saved_cost=saved_amount)
@@ -210,14 +202,14 @@ async def handle_chat_completion(body: dict, tenant: str):
                     for idx, tc in enumerate(assistant_message["tool_calls"]):
                         formatted_tool_calls.append({
                             "index": idx,
-                            "id": tc.get("id", f"call_strict_{idx}"),
+                            "id": tc.get("id", f"call_step_{idx}"),
                             "type": tc.get("type", "function"),
                             "function": tc.get("function", {})
                         })
                     delta_payload["tool_calls"] = formatted_tool_calls
 
                 chunk_data = {
-                    "id": "chatcmpl-strict-cached",
+                    "id": "chatcmpl-step-cached",
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
                     "model": client_model,
@@ -226,7 +218,7 @@ async def handle_chat_completion(body: dict, tenant: str):
                 yield f"data: {json.dumps(chunk_data)}\n\n"
                 
                 end_chunk = {
-                    "id": "chatcmpl-strict-cached",
+                    "id": "chatcmpl-step-cached",
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
                     "model": client_model,
@@ -237,7 +229,7 @@ async def handle_chat_completion(body: dict, tenant: str):
             return StreamingResponse(cached_stream(), media_type="text/event-stream")
         else:
             return {
-                "id": "chatcmpl-strict-cached",
+                "id": "chatcmpl-step-cached",
                 "object": "chat.completion",
                 "created": int(time.time()),
                 "model": client_model,
@@ -246,60 +238,44 @@ async def handle_chat_completion(body: dict, tenant: str):
 
     # 2. 未命中，转发给 DeepSeek 官方
     update_metrics(tenant, hit=False, saved_cost=0.0)
-    headers = {
-        "Authorization": f"Bearer {REAL_LLM_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {REAL_LLM_API_KEY}", "Content-Type": "application/json"}
     
     async def proxy_stream():
         full_content = ""
         collected_tool_calls = {}
         has_sent_finish = False
-        token_tracker = {"prompt": max(200, len(user_prompt))}
+        token_tracker = {"prompt": max(100, len(current_step_query))}
         
         async with httpx.AsyncClient(timeout=60.0) as client:
             async with client.stream("POST", f"{REAL_LLM_BASE_URL.rstrip('/')}/chat/completions", json=body, headers=headers) as response:
                 if response.status_code != 200:
                     error_detail = await response.aread()
-                    err_msg = error_detail.decode()
-                    print(f"🔥 Upstream DeepSeek error [{response.status_code}]: {err_msg}")
-                    yield f"data: {json.dumps({'error': err_msg})}\n\n"
+                    yield f"data: {json.dumps({'error': error_detail.decode()})}\n\n"
                     return
                 
                 async for line in response.aiter_lines():
-                    if not line:
-                        continue
+                    if not line: continue
                     line_str = line.strip()
                     if line_str.startswith("data: "):
                         data_content = line_str[6:].strip()
-                        if data_content == "[DONE]":
-                            continue
+                        if data_content == "[DONE]": continue
                         try:
                             data = json.loads(data_content)
                             if "usage" in data and data["usage"]:
                                 token_tracker["prompt"] = data["usage"].get("prompt_tokens", token_tracker["prompt"])
-
                             choices = data.get("choices", [])
                             if choices:
                                 delta = choices[0].get("delta", {})
-                                content = delta.get("content", "")
-                                if content:
-                                    full_content += content
-                                
-                                t_calls = delta.get("tool_calls")
-                                if t_calls:
-                                    for tc in t_calls:
-                                        idx = tc.get("index", 0)
-                                        if idx not in collected_tool_calls:
-                                            collected_tool_calls[idx] = {"id": tc.get("id"), "type": tc.get("type", "function"), "function": {"name": "", "arguments": ""}}
-                                        if tc.get("id"):
-                                            collected_tool_calls[idx]["id"] = tc.get("id")
-                                        func = tc.get("function", {})
-                                        if func.get("name"):
-                                            collected_tool_calls[idx]["function"]["name"] += func.get("name")
-                                        if func.get("arguments"):
-                                            collected_tool_calls[idx]["function"]["arguments"] += func.get("arguments")
-
+                                if delta.get("content"):
+                                    full_content += delta.get("content")
+                                for tc in delta.get("tool_calls", []):
+                                    idx = tc.get("index", 0)
+                                    if idx not in collected_tool_calls:
+                                        collected_tool_calls[idx] = {"id": tc.get("id"), "type": tc.get("type", "function"), "function": {"name": "", "arguments": ""}}
+                                    if tc.get("id"): collected_tool_calls[idx]["id"] = tc.get("id")
+                                    func = tc.get("function", {})
+                                    if func.get("name"): collected_tool_calls[idx]["function"]["name"] += func.get("name")
+                                    if func.get("arguments"): collected_tool_calls[idx]["function"]["arguments"] += func.get("arguments")
                                 if choices[0].get("finish_reason"):
                                     has_sent_finish = True
                         except Exception:
@@ -309,53 +285,37 @@ async def handle_chat_completion(body: dict, tenant: str):
                         yield f"{line_str}\n\n"
 
         if not has_sent_finish:
-            finish_reason_fallback = "tool_calls" if collected_tool_calls else "stop"
             finish_chunk = {
-                "id": "chatcmpl-proxy-end",
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": client_model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason_fallback}]
+                "id": "chatcmpl-proxy-end", "object": "chat.completion.chunk", "created": int(time.time()),
+                "model": client_model, "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls" if collected_tool_calls else "stop"}]
             }
             yield f"data: {json.dumps(finish_chunk)}\n\n"
-        
         yield "data: [DONE]\n\n"
             
+        # 异步持久化该原子步骤的工具调用
         tool_names = [tc["function"]["name"] for tc in collected_tool_calls.values() if "function" in tc and "name" in tc["function"]]
-        print(f"📝 准备写入向量 [租户: {tenant}] -> Prompt: '{user_prompt[:30]}...', 工具: {tool_names}")
-        
-        if vector_index and user_prompt:
+        if vector_index and current_step_query and tool_names:
             assistant_msg = {"role": "assistant"}
-            if full_content:
-                assistant_msg["content"] = full_content
-            if collected_tool_calls:
-                assistant_msg["tool_calls"] = list(collected_tool_calls.values())
+            if full_content: assistant_msg["content"] = full_content
+            if collected_tool_calls: assistant_msg["tool_calls"] = list(collected_tool_calls.values())
 
-            p_tokens = token_tracker["prompt"]
-            c_tokens = max(100, len(full_content) // 2)
-
-            if assistant_msg.get("content") or assistant_msg.get("tool_calls"):
-                try:
-                    vector_index.upsert(
-                        vectors=[{
-                            "id": f"strict-{tenant}-{int(time.time()*1000)}",
-                            "data": user_prompt,
-                            "metadata": {
-                                "tenant": tenant, 
-                                "tool_names": json.dumps(tool_names, ensure_ascii=False),
-                                "assistant_message": json.dumps(assistant_msg, ensure_ascii=False),
-                                "prompt_tokens": p_tokens,
-                                "completion_tokens": c_tokens
-                            }
-                        }]
-                    )
-                    print(f"💾 写入成功 [Tenant: {tenant}]")
-                except Exception as e:
-                    print(f"🔥 Vector upsert error: {e}")
-            else:
-                print("⚠️ assistant_msg 为空，放弃写入")
-        else:
-            print("⚠️ 跳过写入缓存")
+            try:
+                vector_index.upsert(
+                    vectors=[{
+                        "id": f"step-{tenant}-{int(time.time()*1000)}",
+                        "data": current_step_query,
+                        "metadata": {
+                            "tenant": tenant,
+                            "tool_names": json.dumps(tool_names, ensure_ascii=False),
+                            "assistant_message": json.dumps(assistant_msg, ensure_ascii=False),
+                            "prompt_tokens": token_tracker["prompt"],
+                            "completion_tokens": max(50, len(str(collected_tool_calls)) // 2)
+                        }
+                    }]
+                )
+                print(f"💾 原子步骤工具缓存写入成功 [Tenant: {tenant}] | Tools: {tool_names}")
+            except Exception as e:
+                print(f"🔥 Step vector upsert error: {e}")
 
     if is_stream:
         return StreamingResponse(proxy_stream(), media_type="text/event-stream")
@@ -369,28 +329,25 @@ async def handle_chat_completion(body: dict, tenant: str):
                 choice = data["choices"][0]
                 message = choice.get("message", {})
                 usage = data.get("usage", {})
-                p_tokens = usage.get("prompt_tokens", max(200, len(user_prompt)))
-                c_tokens = usage.get("completion_tokens", max(100, len(message.get("content", "")) // 2))
-
                 tool_names = [tc["function"]["name"] for tc in message.get("tool_calls", []) if "function" in tc and "name" in tc["function"]]
                 
-                if vector_index and user_prompt:
+                if vector_index and current_step_query and tool_names:
                     vector_index.upsert(
                         vectors=[{
-                            "id": f"strict-{tenant}-{int(time.time()*1000)}",
-                            "data": user_prompt,
+                            "id": f"step-{tenant}-{int(time.time()*1000)}",
+                            "data": current_step_query,
                             "metadata": {
-                                "tenant": tenant, 
+                                "tenant": tenant,
                                 "tool_names": json.dumps(tool_names, ensure_ascii=False),
                                 "assistant_message": json.dumps(message, ensure_ascii=False),
-                                "prompt_tokens": p_tokens,
-                                "completion_tokens": c_tokens
+                                "prompt_tokens": usage.get("prompt_tokens", 500),
+                                "completion_tokens": usage.get("completion_tokens", 100)
                             }
                         }]
                     )
-                    print(f"💾 非流式写入成功 [{tenant}]")
+                    print(f"💾 非流式原子步骤缓存写入成功 [{tenant}]")
             except Exception as e:
-                print(f"🔥 Non-stream cache error: {e}")
+                print(f"🔥 Non-stream step cache error: {e}")
             return data
 
 @app.post("/v1/chat/completions")
@@ -429,7 +386,7 @@ def get_stats(tenant: str = "public-default-tenant"):
             }
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_status=500, detail=str(e))
 
 @app.post("/admin/create_tenant")
 def create_tenant(api_key: str, name: str, plan: str = "pro", days_valid: int = 30):
