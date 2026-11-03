@@ -10,7 +10,7 @@ import httpx
 from upstash_vector import Index
 from upstash_redis import Redis
 
-app = FastAPI(title="AI Agent Step-Level Tool Cache Gateway", version="3.6.0")
+app = FastAPI(title="AI Agent Step-Level Cache & Loop-Guard Gateway", version="3.6.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -102,6 +102,21 @@ def update_metrics(tenant: str, hit: bool, saved_cost: float = 0.0):
     except Exception as e:
         print(f"🔥 Metrics update error: {e}")
 
+def detect_infinite_loop(messages: list) -> bool:
+    """网关级死循环检测：检查最近两次 assistant 回复是否完全一致"""
+    assistant_signatures = []
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            content = msg.get("content", "") or ""
+            tool_calls = msg.get("tool_calls", []) or []
+            signature = f"{content.strip()}:{json.dumps(tool_calls, sort_keys=True)}"
+            assistant_signatures.append(signature)
+    
+    if len(assistant_signatures) >= 2 and assistant_signatures[-1] == assistant_signatures[-2]:
+        if assistant_signatures[-1] != ":" : # 排除纯空回复
+            return True
+    return False
+
 @app.get("/v1/models")
 @app.get("/models")
 @app.get("/v1/v1/models")
@@ -118,7 +133,15 @@ def list_models():
 async def handle_chat_completion(body: dict, tenant: str):
     messages = body.get("messages", [])
     
-    # 提取当前激活的子任务意图（取 messages 中最新的用户发言或最后一条局部指令）
+    # 🛑 1. 核心护栏：检测死循环，若陷入死循环则主动向上下文中注入系统熔断警告
+    if detect_infinite_loop(messages):
+        print(f"🚨 [LOOP GUARD ACTIVATED] 检测到租户 [{tenant}] 的 Agent 陷入死循环！正在注入强制熔断警告...")
+        messages.append({
+            "role": "system",
+            "content": "【网关强制护栏】检测到你正在陷入重复输出或重复调用相同工具的死循环中。请立刻停止当前死循环，绝对不要再次调用任何工具，请根据已有线索直接向用户给出最终结论与总结报告。"
+        })
+        body["messages"] = messages
+
     current_step_query = ""
     for msg in reversed(messages):
         if isinstance(msg, dict) and msg.get("role") in ["user", "tool"]:
@@ -134,7 +157,7 @@ async def handle_chat_completion(body: dict, tenant: str):
             if current_step_query:
                 break
 
-    # 🛑 过滤 DSH 后台系统辅助请求
+    # 🛑 2. 过滤 DSH 后台系统辅助请求
     background_keywords = [
         "Generate the session title", 
         "Time sampled while preparing", 
@@ -160,19 +183,19 @@ async def handle_chat_completion(body: dict, tenant: str):
 
     print(f"📥 收到步骤级请求 [租户: {tenant}] | Query片段: '{current_step_query[:50]}...'")
 
-    # 1. 步骤级原子向量检索 (阈值设为 0.82，兼顾灵活性与准确度)
+    # 3. 步骤级原子向量检索 (阈值 0.75，兼顾灵活性)
     cached_data = None
     if vector_index and current_step_query:
         try:
             results = vector_index.query(data=current_step_query, top_k=1, include_metadata=True)
-            if results and results[0].score >= 0.82:
+            if results and results[0].score >= 0.75:
                 meta = results[0].metadata
                 if meta and meta.get("tenant") == tenant:
                     cached_data = meta
                     print(f"🎯 [STEP-LEVEL HIT] 成功命中原子工具步骤！租户 [{tenant}] | 得分: {results[0].score:.2f} | 绑定工具: {meta.get('tool_names')}")
             else:
                 score_val = results[0].score if results else 0.0
-                print(f"🔍 Step Cache MISS (最高得分 {score_val:.2f} < 0.82)")
+                print(f"🔍 Step Cache MISS (最高得分 {score_val:.2f} < 0.75)")
         except Exception as e:
             print(f"🔥 Vector search error: {e}")
 
@@ -236,7 +259,7 @@ async def handle_chat_completion(body: dict, tenant: str):
                 "choices": [{"index": 0, "message": assistant_message, "finish_reason": proper_finish_reason}]
             }
 
-    # 2. 未命中，转发给 DeepSeek 官方
+    # 4. 未命中，转发给 DeepSeek 官方
     update_metrics(tenant, hit=False, saved_cost=0.0)
     headers = {"Authorization": f"Bearer {REAL_LLM_API_KEY}", "Content-Type": "application/json"}
     
@@ -292,7 +315,6 @@ async def handle_chat_completion(body: dict, tenant: str):
             yield f"data: {json.dumps(finish_chunk)}\n\n"
         yield "data: [DONE]\n\n"
             
-        # 异步持久化该原子步骤的工具调用
         tool_names = [tc["function"]["name"] for tc in collected_tool_calls.values() if "function" in tc and "name" in tc["function"]]
         if vector_index and current_step_query and tool_names:
             assistant_msg = {"role": "assistant"}
@@ -386,7 +408,7 @@ def get_stats(tenant: str = "public-default-tenant"):
             }
         }
     except Exception as e:
-        raise HTTPException(status_status=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/admin/create_tenant")
 def create_tenant(api_key: str, name: str, plan: str = "pro", days_valid: int = 30):
