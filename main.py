@@ -10,7 +10,7 @@ import httpx
 from upstash_vector import Index
 from upstash_redis import Redis
 
-app = FastAPI(title="AI Agent Tool-Chain Cache Gateway - SaaS Edition", version="3.0.0")
+app = FastAPI(title="AI Agent Tool-Signature Gateway - FinOps Edition", version="3.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -118,7 +118,6 @@ def list_models():
 async def handle_chat_completion(body: dict, tenant: str):
     messages = body.get("messages", [])
     
-    # 提取用户输入的 Prompt
     user_prompt = ""
     for msg in reversed(messages):
         if isinstance(msg, dict) and msg.get("role") == "user":
@@ -131,38 +130,37 @@ async def handle_chat_completion(body: dict, tenant: str):
                         user_prompt = part.get("text", "")
             break
 
-    # 检查是否为 Agent 工具内部循环的返回结果步骤
     last_message = messages[-1] if messages else {}
     is_agent_loop = isinstance(last_message, dict) and last_message.get("role") in ["tool", "function"]
 
     is_stream = body.get("stream", False)
     client_model = body.get("model", DEFAULT_CHAT_MODEL)
 
-    print(f"📥 收到 Agent 任务 [租户: {tenant}] | Prompt: '{user_prompt[:50]}...' | Stream: {is_stream} | AgentLoop: {is_agent_loop}")
+    print(f"📥 收到 Agent 意图检索 [租户: {tenant}] | Prompt: '{user_prompt[:50]}...' | AgentLoop: {is_agent_loop}")
 
-    # 1. 尝试匹配已缓存的 Agent 工具链 / 执行计划
+    # 1. 语义与工具签名混合匹配 (将阈值放宽至 0.75 以实现意图泛化)
     cached_data = None
     if vector_index and user_prompt and not is_agent_loop:
         try:
             results = vector_index.query(data=user_prompt, top_k=1, include_metadata=True)
-            if results and results[0].score >= 0.88:  # 稍微放宽一点阈值以更好匹配复杂意图
+            if results and results[0].score >= 0.75:
                 meta = results[0].metadata
                 if meta and meta.get("tenant") == tenant:
                     cached_data = meta
-                    is_tool_chain_hit = meta.get("is_tool_chain", False)
-                    print(f"🎯 {'[AGENT TOOL-CHAIN] ' if is_tool_chain_hit else ''}Cache HIT for tenant [{tenant}] prompt: '{user_prompt}' (Score: {results[0].score})")
+                    tool_names = meta.get("tool_names", "[]")
+                    print(f"🎯 [TOOL-SIGNATURE HIT] 跨表述意图命中！租户 [{tenant}] | 得分: {results[0].score:.2f} | 绑定工具: {tool_names}")
             else:
                 score_val = results[0].score if results else 0.0
-                print(f"🔍 Cache MISS (Score {score_val:.2f} < 0.88) for prompt: '{user_prompt}'")
+                print(f"🔍 Cache MISS (Score {score_val:.2f} < 0.75) for prompt: '{user_prompt}'")
         except Exception as e:
             print(f"🔥 Vector search error: {e}")
     else:
-        print(f"⏭️ 跳过语义检索 (vector_index有效: {bool(vector_index)}, 有效Prompt: {bool(user_prompt)}, 非AgentLoop: {not is_agent_loop})")
+        print(f"⏭️ 跳过语义检索 (有效Prompt: {bool(user_prompt)}, 非AgentLoop: {not is_agent_loop})")
 
     if cached_data:
         assistant_message_json = cached_data.get("assistant_message")
-        prompt_tokens = int(cached_data.get("prompt_tokens", 1200)) # 复杂任务通常消耗更多 Token
-        completion_tokens = int(cached_data.get("completion_tokens", 400))
+        prompt_tokens = int(cached_data.get("prompt_tokens", 1500))
+        completion_tokens = int(cached_data.get("completion_tokens", 500))
         
         saved_amount = calculate_saved_cost(client_model, prompt_tokens, completion_tokens)
         update_metrics(tenant, hit=True, saved_cost=saved_amount)
@@ -185,14 +183,14 @@ async def handle_chat_completion(body: dict, tenant: str):
                     for idx, tc in enumerate(assistant_message["tool_calls"]):
                         formatted_tool_calls.append({
                             "index": idx,
-                            "id": tc.get("id", f"call_cached_{idx}"),
+                            "id": tc.get("id", f"call_sig_{idx}"),
                             "type": tc.get("type", "function"),
                             "function": tc.get("function", {})
                         })
                     delta_payload["tool_calls"] = formatted_tool_calls
 
                 chunk_data = {
-                    "id": "chatcmpl-agent-cached",
+                    "id": "chatcmpl-sig-cached",
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
                     "model": client_model,
@@ -201,7 +199,7 @@ async def handle_chat_completion(body: dict, tenant: str):
                 yield f"data: {json.dumps(chunk_data)}\n\n"
                 
                 end_chunk = {
-                    "id": "chatcmpl-agent-cached",
+                    "id": "chatcmpl-sig-cached",
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
                     "model": client_model,
@@ -212,14 +210,14 @@ async def handle_chat_completion(body: dict, tenant: str):
             return StreamingResponse(cached_stream(), media_type="text/event-stream")
         else:
             return {
-                "id": "chatcmpl-agent-cached",
+                "id": "chatcmpl-sig-cached",
                 "object": "chat.completion",
                 "created": int(time.time()),
                 "model": client_model,
                 "choices": [{"index": 0, "message": assistant_message, "finish_reason": proper_finish_reason}]
             }
 
-    # 2. 未命中，转发给 DeepSeek 官方并实时捕获其工具调度链
+    # 2. 未命中，转发给 DeepSeek 官方并提取工具签名
     update_metrics(tenant, hit=False, saved_cost=0.0)
     headers = {
         "Authorization": f"Bearer {REAL_LLM_API_KEY}",
@@ -296,8 +294,10 @@ async def handle_chat_completion(body: dict, tenant: str):
         
         yield "data: [DONE]\n\n"
             
-        # 任务完成后的工具链与执行计划持久化缓存
-        print(f"📝 准备持久化 Agent 工具链 [租户: {tenant}] -> user_prompt: '{user_prompt}', 包含Tools: {bool(collected_tool_calls)}")
+        # 提取工具签名并持久化缓存
+        tool_names = [tc["function"]["name"] for tc in collected_tool_calls.values() if "function" in tc and "name" in tc["function"]]
+        print(f"📝 持久化工具签名 [租户: {tenant}] -> 提取到工具列表: {tool_names}")
+        
         if vector_index and user_prompt:
             assistant_msg = {"role": "assistant"}
             if full_content:
@@ -306,28 +306,28 @@ async def handle_chat_completion(body: dict, tenant: str):
                 assistant_msg["tool_calls"] = list(collected_tool_calls.values())
 
             p_tokens = token_tracker["prompt"]
-            c_tokens = max(100, len(full_content) // 2 + len(str(collected_tool_calls)))
+            c_tokens = max(100, len(full_content) // 2)
 
             if assistant_msg.get("content") or assistant_msg.get("tool_calls"):
                 try:
                     vector_index.upsert(
                         vectors=[{
-                            "id": f"agent-plan-{tenant}-{int(time.time()*1000)}",
+                            "id": f"tool-sig-{tenant}-{int(time.time()*1000)}",
                             "data": user_prompt,
                             "metadata": {
                                 "tenant": tenant, 
-                                "is_tool_chain": bool(collected_tool_calls),
+                                "tool_names": json.dumps(tool_names, ensure_ascii=False),
                                 "assistant_message": json.dumps(assistant_msg, ensure_ascii=False),
                                 "prompt_tokens": p_tokens,
                                 "completion_tokens": c_tokens
                             }
                         }]
                     )
-                    print(f"💾 Agent Tool-Chain Plan Cached successfully! [Tenant: {tenant}] (Tools: {bool(collected_tool_calls)}, P:{p_tokens}, C:{c_tokens})")
+                    print(f"💾 Tool-Signature Plan Cached successfully! [Tenant: {tenant}] (Tools: {tool_names})")
                 except Exception as e:
                     print(f"🔥 Vector upsert error: {e}")
             else:
-                print("⚠️ assistant_msg 内容为空，放弃 Agent 缓存写入")
+                print("⚠️ assistant_msg 内容为空，放弃缓存写入")
         else:
             print(f"⚠️ 跳过写入缓存：vector_index有效={bool(vector_index)}, 有效Prompt={bool(user_prompt)}")
 
@@ -346,23 +346,24 @@ async def handle_chat_completion(body: dict, tenant: str):
                 p_tokens = usage.get("prompt_tokens", max(200, len(user_prompt)))
                 c_tokens = usage.get("completion_tokens", max(100, len(message.get("content", "")) // 2))
 
-                has_tc = bool(message.get("tool_calls"))
-                print(f"📝 非流式 Agent 任务持久化 [租户: {tenant}] -> 包含Tools: {has_tc}")
+                tool_names = [tc["function"]["name"] for tc in message.get("tool_calls", []) if "function" in tc and "name" in tc["function"]]
+                print(f"📝 非流式工具签名持久化 [租户: {tenant}] -> Tools: {tool_names}")
+                
                 if vector_index and user_prompt:
                     vector_index.upsert(
                         vectors=[{
-                            "id": f"agent-plan-{tenant}-{int(time.time()*1000)}",
+                            "id": f"tool-sig-{tenant}-{int(time.time()*1000)}",
                             "data": user_prompt,
                             "metadata": {
                                 "tenant": tenant, 
-                                "is_tool_chain": has_tc,
+                                "tool_names": json.dumps(tool_names, ensure_ascii=False),
                                 "assistant_message": json.dumps(message, ensure_ascii=False),
                                 "prompt_tokens": p_tokens,
                                 "completion_tokens": c_tokens
                             }
                         }]
                     )
-                    print(f"💾 Non-stream Agent Tool-Chain Cached successfully for tenant [{tenant}]")
+                    print(f"💾 Non-stream Tool-Signature Cached successfully for tenant [{tenant}]")
             except Exception as e:
                 print(f"🔥 Non-stream cache upsert error: {e}")
             return data
@@ -403,7 +404,7 @@ def get_stats(tenant: str = "public-default-tenant"):
             }
         }
     except Exception as e:
-        raise HTTPException(status_status=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/admin/create_tenant")
 def create_tenant(api_key: str, name: str, plan: str = "pro", days_valid: int = 30):
